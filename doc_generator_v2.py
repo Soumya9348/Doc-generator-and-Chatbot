@@ -82,33 +82,39 @@ STATE_TABLE       = "platform.engineering.workflow_doc_state"
 NOTEBOOK_ROOT     = "/Workspace"
 
 # ── LLM Config ───────────────────────────────────────────────────────────────
-# Split model strategy:
-#   Stage 1 — per-notebook summarisation. Runs N times (once per notebook).
-#             Cost matters. Llama 3.3 70B is fast and cheap.
-#             Token limit raised to 3000 — complex notebooks need room.
+# Single model — Llama 3.3 70B for both stages. Most cost-effective stable
+# pay-per-token model on Databricks as of March 2026.
 #
-#   Stage 2 — unified RAG doc generation. Runs once per source.
-#             Quality is everything here — this doc powers the chatbot.
-#             Claude 3.5 Sonnet: best instruction following on Databricks,
-#             prompt caching supported (reduces cost on repeated sections),
-#             replaces 405B which was retired Feb 15 2026.
+# Retired/unavailable: 405B (Feb 2026), Claude 3.5 Sonnet (unavailable),
+#   Claude 3.7 Sonnet (retiring Apr 2026), Llama 4 Maverick (Mar 2026).
+#
+# Stage 1 quality issues were prompt + token problems, not model problems.
+# Stage 2 uses TWO sequential calls (technical + operational halves) to
+# stay within 70B output limits and avoid trailing-off on long outputs.
+#
+# Alternative if available in your workspace:
+#   LLM_ENDPOINT = "databricks-gemini-3-1-flash-lite"  # slightly stronger on long structured output
 
-# Stage 1 — per-notebook summary (cost-optimised)
-LLM_STAGE1_ENDPOINT   = "databricks-meta-llama-3-3-70b-instruct"
-LLM_STAGE1_MAX_TOKENS = 3000    # raised from 2000 — complex notebooks need room
-
-# Stage 2 — unified RAG document (quality-optimised)
-LLM_STAGE2_ENDPOINT   = "databricks-claude-3-5-sonnet"   # 405B retired Feb 2026
-LLM_STAGE2_MAX_TOKENS = 8000
+LLM_ENDPOINT          = "databricks-meta-llama-3-3-70b-instruct"
+LLM_STAGE1_MAX_TOKENS = 3000    # per-notebook summary (or per-half for large notebooks)
+LLM_STAGE2_MAX_TOKENS = 5000    # per Stage 2 half-doc (called twice)
 
 # Shared
 LLM_TEMPERATURE   = 0.1
 LLM_RETRY_LIMIT   = 3
-LLM_RETRY_BACKOFF = 2.0
+
+# Timeouts — 70B on large prompts routinely takes 3-5 minutes.
+# Retry wait must also be long: retrying immediately after a 5-min timeout is pointless.
+LLM_TIMEOUT_STAGE1 = 300       # seconds — per-notebook summary call
+LLM_TIMEOUT_STAGE2 = 480       # seconds — unified doc half (bigger prompt + output)
+LLM_RETRY_WAIT     = 30        # seconds — base wait after timeout (doubles each retry)
 
 # ── Processing Config ─────────────────────────────────────────────────────────
-MAX_CODE_CHARS     = 40_000    # raised from 20_000 — 70B has 128K context, use it
-MAX_PARALLEL_CALLS = 4
+# MAX_CODE_CHARS: soft limit per LLM call. Notebooks ABOVE this are split into
+# two halves, each summarised separately, then merged. This keeps any single
+# LLM input manageable and prevents timeouts on very large notebooks.
+MAX_CODE_CHARS     = 25_000    # chars per LLM call (~6K tokens input — safe for 70B)
+MAX_PARALLEL_CALLS = 2         # reduced from 4 — avoids saturating the endpoint
 
 log.info("Config loaded for source: %s", source)
 
@@ -210,49 +216,68 @@ for p in workflow_paths:
 def call_llm(
     prompt: str,
     context: str = "",
-    endpoint: str = LLM_STAGE1_ENDPOINT,
     max_tokens: int = LLM_STAGE1_MAX_TOKENS,
+    timeout: int = LLM_TIMEOUT_STAGE1,
 ) -> str:
     """
     Call Databricks model serving with exponential backoff retry.
-    Distinguishes retryable (5xx, 429) from non-retryable (4xx) errors.
 
     Args:
         prompt:     The user prompt.
         context:    Label for logging (e.g. notebook name).
-        endpoint:   Model serving endpoint name. Defaults to Stage 1 (70B).
-        max_tokens: Max tokens for this call. Stage 1=2000, Stage 2=8000.
+        max_tokens: Output token limit.
+        timeout:    HTTP read timeout in seconds. Use LLM_TIMEOUT_STAGE1 (300s)
+                    for notebook summaries and LLM_TIMEOUT_STAGE2 (480s) for
+                    unified doc calls. Do NOT use 120s — 70B on large prompts
+                    regularly takes 3-5 minutes to respond.
+
+    Retry strategy:
+        - HTTP 4xx (except 429): non-retryable, raise immediately.
+        - HTTP 5xx, 429, or timeout: retry up to LLM_RETRY_LIMIT times.
+        - Wait = LLM_RETRY_WAIT * 2^(attempt-1). Starts at 30s because
+          retrying immediately after a 5-minute timeout is pointless.
     """
-    url     = f"{WORKSPACE_URL}/serving-endpoints/{endpoint}/invocations"
+    url     = f"{WORKSPACE_URL}/serving-endpoints/{LLM_ENDPOINT}/invocations"
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "temperature": LLM_TEMPERATURE,
         "max_tokens": max_tokens,
     }
-    log.debug("LLM → endpoint=%s  max_tokens=%d  context=%s", endpoint, max_tokens, context)
+    log.debug("LLM → max_tokens=%d  timeout=%ds  context=%s", max_tokens, timeout, context)
 
     last_error = None
     for attempt in range(1, LLM_RETRY_LIMIT + 1):
         try:
-            r = requests.post(url, headers=HEADERS, json=payload, timeout=120)
+            r = requests.post(url, headers=HEADERS, json=payload, timeout=timeout)
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
 
         except requests.HTTPError as e:
             if r.status_code < 500 and r.status_code != 429:
-                raise
+                raise                       # 4xx errors are not transient — fail fast
             last_error = e
-            wait = LLM_RETRY_BACKOFF * (2 ** (attempt - 1))
-            log.warning("LLM attempt %d failed: %s — retrying in %.1fs", attempt, e, wait)
+            wait = LLM_RETRY_WAIT * (2 ** (attempt - 1))
+            log.warning("LLM attempt %d/%d HTTP error: %s — retrying in %ds",
+                        attempt, LLM_RETRY_LIMIT, e, wait)
+            time.sleep(wait)
+
+        except requests.Timeout as e:
+            last_error = e
+            wait = LLM_RETRY_WAIT * (2 ** (attempt - 1))
+            log.warning("LLM attempt %d/%d TIMEOUT after %ds — retrying in %ds",
+                        attempt, LLM_RETRY_LIMIT, timeout, wait)
             time.sleep(wait)
 
         except Exception as e:
             last_error = e
-            wait = LLM_RETRY_BACKOFF * (2 ** (attempt - 1))
-            log.warning("LLM attempt %d error: %s — retrying in %.1fs", attempt, e, wait)
+            wait = LLM_RETRY_WAIT * (2 ** (attempt - 1))
+            log.warning("LLM attempt %d/%d error: %s — retrying in %ds",
+                        attempt, LLM_RETRY_LIMIT, e, wait)
             time.sleep(wait)
 
-    raise RuntimeError(f"LLM failed after {LLM_RETRY_LIMIT} attempts [{context}]: {last_error}")
+    raise RuntimeError(
+        f"LLM failed after {LLM_RETRY_LIMIT} attempts [{context}]: {last_error}"
+    )
 
 # COMMAND ----------
 # MAGIC %md ## Cell 7 — Stage 1: Per-Notebook Deep Summary
@@ -387,45 +412,143 @@ def clean_code(raw: str) -> str:
     return "\n".join(lines)
 
 
-def summarize_notebook(path: str, raw_content: str) -> dict:
-    name       = path.split("/")[-1]
-    cleaned    = clean_code(raw_content)
-    truncated  = len(cleaned) > MAX_CODE_CHARS
-    code       = cleaned[:MAX_CODE_CHARS]
-
-    if truncated:
-        log.warning(
-            "Notebook '%s' truncated: %d → %d chars (~%d%% of code analysed). "
-            "Transformation logic in later cells may be incomplete.",
-            name, len(cleaned), MAX_CODE_CHARS,
-            int(MAX_CODE_CHARS / len(cleaned) * 100),
-        )
-        # Append a truncation marker so the LLM knows to flag incomplete sections
-        code += "\n\n# [TRUNCATED — remaining code not shown. Note this in your output.]"
-
-    prompt = NOTEBOOK_SUMMARY_PROMPT.format(
-        source=source.title(),
-        name=name,
-        path=path,
-        code=code,
+def _call_stage1(prompt: str, context: str) -> str:
+    """Wrapper: Stage 1 always uses Stage 1 timeout."""
+    return call_llm(
+        prompt,
+        context=context,
+        max_tokens=LLM_STAGE1_MAX_TOKENS,
+        timeout=LLM_TIMEOUT_STAGE1,
     )
 
-    try:
-        # Stage 1 — use 70B (fast, cost-optimised)
-        summary = call_llm(
-            prompt,
-            context=name,
-            endpoint=LLM_STAGE1_ENDPOINT,
-            max_tokens=LLM_STAGE1_MAX_TOKENS,
+
+def summarize_notebook(path: str, raw_content: str) -> dict:
+    """
+    Summarise a single notebook.
+
+    Large notebook strategy (> MAX_CODE_CHARS):
+    Instead of truncating, split the code into two halves and run two
+    separate LLM calls. Each half gets the full prompt context (name, path,
+    source) so the model knows what it is analysing. The two partial summaries
+    are then merged with a lightweight third call.
+
+    This avoids both truncation (missing transformation logic) AND timeouts
+    (sending too much code in one call).
+    """
+    name    = path.split("/")[-1]
+    cleaned = clean_code(raw_content)
+    total   = len(cleaned)
+
+    if total <= MAX_CODE_CHARS:
+        # ── Small notebook: single call ───────────────────────────────────────
+        log.info("Summarising (single call, %d chars): %s", total, name)
+        prompt = NOTEBOOK_SUMMARY_PROMPT.format(
+            source=source.title(), name=name, path=path, code=cleaned,
         )
-        log.info("✓ Summarised: %s", name)
-        return {"path": path, "name": name, "summary": summary, "error": None}
-    except Exception as e:
-        log.error("✗ Failed: %s — %s", name, e)
-        return {
-            "path": path, "name": name,
-            "summary": f"_Summary unavailable: {e}_", "error": str(e),
-        }
+        try:
+            summary = _call_stage1(prompt, context=name)
+            log.info("✓ Summarised: %s", name)
+            return {"path": path, "name": name, "summary": summary, "error": None}
+        except Exception as e:
+            log.error("✗ Failed: %s — %s", name, e)
+            return {"path": path, "name": name,
+                    "summary": f"_Summary unavailable: {e}_", "error": str(e)}
+
+    else:
+        # ── Large notebook: split into two halves, then merge ─────────────────
+        mid = total // 2
+        # Split at a newline boundary near the midpoint to avoid cutting mid-line
+        split_at = cleaned.rfind("\n", 0, mid) + 1
+        if split_at <= 0:
+            split_at = mid
+        half_a = cleaned[:split_at]
+        half_b = cleaned[split_at:]
+
+        log.warning(
+            "Large notebook '%s' (%d chars) — splitting into two halves "
+            "(%d + %d chars) to avoid timeout.",
+            name, total, len(half_a), len(half_b),
+        )
+
+        half_note_a = (
+            "NOTE: This is the FIRST HALF of the notebook. "
+            "Analyse only what is visible. A second half exists and will be merged."
+        )
+        half_note_b = (
+            "NOTE: This is the SECOND HALF of the notebook. "
+            "Analyse only what is visible. A first half was already analysed."
+        )
+
+        errors = []
+        summary_a = summary_b = None
+
+        try:
+            prompt_a = NOTEBOOK_SUMMARY_PROMPT.format(
+                source=source.title(), name=f"{name} (half 1/2)",
+                path=path, code=half_a + f"\n\n# {half_note_a}",
+            )
+            summary_a = _call_stage1(prompt_a, context=f"{name}_half1")
+            log.info("✓ Half 1/2 done: %s", name)
+        except Exception as e:
+            errors.append(f"half1: {e}")
+            log.error("✗ Half 1/2 failed: %s — %s", name, e)
+
+        try:
+            prompt_b = NOTEBOOK_SUMMARY_PROMPT.format(
+                source=source.title(), name=f"{name} (half 2/2)",
+                path=path, code=half_b + f"\n\n# {half_note_b}",
+            )
+            summary_b = _call_stage1(prompt_b, context=f"{name}_half2")
+            log.info("✓ Half 2/2 done: %s", name)
+        except Exception as e:
+            errors.append(f"half2: {e}")
+            log.error("✗ Half 2/2 failed: %s — %s", name, e)
+
+        if not summary_a and not summary_b:
+            return {"path": path, "name": name,
+                    "summary": f"_Both halves failed: {errors}_", "error": str(errors)}
+
+        # If only one half succeeded, use it with a warning
+        if not summary_a or not summary_b:
+            partial = summary_a or summary_b
+            warn = "_WARNING: Only one half of this notebook was successfully summarised._\n\n"
+            return {"path": path, "name": name, "summary": warn + partial, "error": str(errors)}
+
+        # ── Merge the two partial summaries ───────────────────────────────────
+        merge_prompt = f"""You are a senior data engineer.
+Two partial summaries of the same Databricks notebook have been generated separately.
+Merge them into ONE complete, coherent summary following the same 13-section structure.
+
+Rules:
+- Combine information from both halves — do not drop anything.
+- Deduplicate repeated points.
+- Use exact names from the code (tables, columns, functions).
+- If the two halves describe different transformation steps, keep all steps in execution order.
+
+Notebook: {name}
+Source: {source.title()}
+Path: {path}
+
+--- FIRST HALF SUMMARY ---
+{summary_a}
+
+--- SECOND HALF SUMMARY ---
+{summary_b}
+
+Produce the merged summary now:"""
+
+        try:
+            merged = _call_stage1(merge_prompt, context=f"{name}_merge")
+            log.info("✓ Merged halves: %s", name)
+            return {"path": path, "name": name, "summary": merged, "error": None}
+        except Exception as e:
+            log.error("✗ Merge failed: %s — falling back to concatenation: %s", name, e)
+            # Fallback: just concatenate both summaries with a divider
+            combined = (
+                f"_NOTE: Merge step failed. Showing both halves concatenated._\n\n"
+                f"### Half 1\n{summary_a}\n\n### Half 2\n{summary_b}"
+            )
+            return {"path": path, "name": name, "summary": combined, "error": str(e)}
 
 
 def summarize_all_notebooks(paths: list, contents: list) -> list[dict]:
@@ -979,7 +1102,18 @@ NOTEBOOK SUMMARIES:
 
 def generate_unified_doc(source: str, summaries: list[dict], timestamp: str) -> str:
     """
-    Stage 2: Generate a single unified RAG-optimised document from all notebook summaries.
+    Stage 2: Generate a single unified RAG-optimised document.
+
+    WHY TWO CALLS:
+    Llama 3.3 70B handles ~5000 output tokens reliably before quality degrades.
+    The full unified doc is 8000-10000 tokens. Splitting into two sequential
+    calls — each generating half the document — produces consistently complete,
+    high-quality output without the model trailing off mid-section.
+
+    Call A: Sections 1-7  (metadata, overview, architecture, notebook breakdown, tables, transformations)
+    Call B: Sections 8-12 (runbook, failure modes, Q&A, glossary, changelog)
+
+    The two halves are concatenated into one final document.
     """
     notebook_list  = ", ".join(r["name"] for r in summaries)
     notebook_count = len(summaries)
@@ -994,24 +1128,123 @@ def generate_unified_doc(source: str, summaries: list[dict], timestamp: str) -> 
         for r in summaries
     )
 
-    prompt = UNIFIED_DOC_PROMPT.format(
-        source=source.title(),
-        timestamp=timestamp,
-        notebook_list=notebook_list,
-        notebook_count=notebook_count,
-        DOC_OUTPUT_VOLUME=DOC_OUTPUT_VOLUME,
-        STATE_TABLE=STATE_TABLE,
-        summaries=summaries_text,
-    )
+    shared_context = f"""Source System  : {source.title()}
+Generated At   : {timestamp}
+Notebooks      : {notebook_list}
 
-    log.info("Generating unified RAG document for source '%s'…", source)
-    # Stage 2 — use 405B (quality-optimised, runs only once per source)
-    return call_llm(
-        prompt,
-        context=f"unified_doc_{source}",
-        endpoint=LLM_STAGE2_ENDPOINT,
-        max_tokens=LLM_STAGE2_MAX_TOKENS,
-    )
+NOTEBOOK SUMMARIES:
+{summaries_text}"""
+
+    rag_rules = """RAG WRITING RULES (follow strictly):
+- Never use pronouns like "it" or "this" to refer to tables or notebooks — always use the full name.
+- Repeat the source system name in every section header.
+- Use exact names from the summaries (table names, column names, function names).
+- No information loss — every table, column, and transformation from the summaries must appear somewhere.
+- Write each section so the first 2 sentences give the plain-English answer, followed by technical depth."""
+
+    # ── Call A: Technical half (Sections 1–7) ────────────────────────────────
+    prompt_a = f"""You are a senior data engineering documentation specialist.
+Generate the FIRST HALF of a unified RAG documentation page for the {source.title()} pipeline.
+
+{rag_rules}
+
+{shared_context}
+
+Generate ONLY these sections (Sections 1 through 7). Stop after Section 7.
+Use this exact structure:
+
+---
+
+# {source.title()} Data Pipeline — Complete Documentation
+
+> **Source System:** {source.title()} | **Platform:** EV Data Platform on Databricks
+> **Last Updated:** {timestamp} | **Auto-generated by:** doc_generator_v2
+
+---
+
+## 1. Document Metadata
+[table: source, platform, layers, notebook count, notebooks, generated at, owner placeholder, slack placeholder]
+
+## 2. Quick Reference Card
+[what it does, tables read, tables written, business impact if down, notebook paths]
+
+## 3. Business Overview
+### 3.1 What Is the {source.title()} Pipeline?
+### 3.2 Business Value
+### 3.3 Data Freshness & SLA
+### 3.4 Business Impact of Failure
+
+## 4. Architecture & End-to-End Data Flow
+[ASCII flow diagram: {source} Source → Landing → Raw → EUH → Curated, with exact table names and notebook names at each layer]
+
+## 5. Notebook-by-Notebook Technical Reference
+[For EACH notebook: full path, layer, purpose, inputs table, outputs table, transformation steps, business rules, error handling, dependencies, known issues]
+
+## 6. Complete Table Catalogue
+[For EACH table: full name, layer, written by, read by, write mode, format, schema with all columns, data types, business meaning]
+
+## 7. Transformation & Business Logic Reference
+### 7.1 Deduplication Strategy
+### 7.2 Filtering Rules
+### 7.3 Join Logic
+### 7.4 Enrichment Logic
+### 7.5 Data Type Casting & Schema Enforcement
+### 7.6 Hardcoded Values & Constants
+"""
+
+    log.info("Stage 2 Call A — generating technical sections (1-7) for '%s'...", source)
+    part_a = call_llm(prompt_a, context=f"unified_doc_a_{source}", max_tokens=LLM_STAGE2_MAX_TOKENS, timeout=LLM_TIMEOUT_STAGE2)
+
+    # ── Call B: Operational half (Sections 8–12) ──────────────────────────────
+    prompt_b = f"""You are a senior data engineering documentation specialist.
+Generate the SECOND HALF of a unified RAG documentation page for the {source.title()} pipeline.
+
+{rag_rules}
+
+{shared_context}
+
+Generate ONLY these sections (Sections 8 through 12). Do not repeat earlier sections.
+Use this exact structure:
+
+## 8. Operational Runbook
+### 8.1 How to Trigger a Manual Run
+### 8.2 How to Force Regenerate Documentation
+### 8.3 First Steps When Something Goes Wrong
+[step-by-step: check job log → identify failed notebook → check state table → check output tables → refer to Section 9]
+### 8.4 Key Tables to Check During Incidents
+[list each table with a suggested COUNT/freshness SQL query]
+### 8.5 Escalation Path
+[P1/P2/P3 table]
+
+## 9. Failure Modes & Debugging Guide
+[For EACH failure mode: name, affected notebook/layer, frequency, severity, root cause, exact error symptom, how to detect, step-by-step resolution, prevention]
+Minimum 5 failure modes. Include at least one per pipeline layer.
+
+## 10. Frequently Asked Questions (Q&A)
+[Minimum 20 Q&A pairs. Write questions exactly as a team member would ask the chatbot.
+Cover all 4 audiences: engineers, support, business, newcomers.
+Reference exact table names, column names, and notebook names in answers.]
+
+## 11. Glossary
+[Table: Term | Full Form | Definition in context of {source.title()} pipeline.
+Include: EV, EUH, ETL, Landing, Raw, Curated, Unity Catalog, Delta, RAG, PAT, SLA, Deduplication, {source.title()}, and every domain term from the summaries.]
+
+## 12. Change Log
+| Version | Date | Trigger | Notebooks Changed | Notes |
+|---------|------|---------|------------------|-------|
+| 1.0 | {timestamp} | initial_generation | {notebook_list} | Auto-generated |
+
+---
+_Auto-generated by doc_generator_v2. For questions contact the platform engineering team._
+"""
+
+    log.info("Stage 2 Call B — generating operational sections (8-12) for '%s'...", source)
+    part_b = call_llm(prompt_b, context=f"unified_doc_b_{source}", max_tokens=LLM_STAGE2_MAX_TOKENS, timeout=LLM_TIMEOUT_STAGE2)
+
+    # ── Concatenate both halves ────────────────────────────────────────────────
+    log.info("Stage 2 complete — concatenating halves for '%s'", source)
+    return part_a.rstrip() + "\n\n" + part_b.lstrip()
+
 
 # COMMAND ----------
 # MAGIC %md ## Cell 9 — Hashing & State Management
