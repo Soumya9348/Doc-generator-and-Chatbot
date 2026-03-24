@@ -84,21 +84,21 @@ NOTEBOOK_ROOT     = "/Workspace"
 # ── LLM Config ───────────────────────────────────────────────────────────────
 # Split model strategy:
 #   Stage 1 — per-notebook summarisation. Runs N times (once per notebook).
-#             Cost matters. Llama 3.3 70B is fast, cheap, and good enough
-#             for structured extraction tasks.
+#             Cost matters. Llama 3.3 70B is fast and cheap.
+#             Token limit raised to 3000 — complex notebooks need room.
 #
 #   Stage 2 — unified RAG doc generation. Runs once per source.
 #             Quality is everything here — this doc powers the chatbot.
-#             Llama 3.1 405B has significantly stronger instruction following
-#             for long, complex, multi-rule prompts.
-#             Token limit raised to 8000 — the unified doc needs room.
+#             Claude 3.5 Sonnet: best instruction following on Databricks,
+#             prompt caching supported (reduces cost on repeated sections),
+#             replaces 405B which was retired Feb 15 2026.
 
 # Stage 1 — per-notebook summary (cost-optimised)
 LLM_STAGE1_ENDPOINT   = "databricks-meta-llama-3-3-70b-instruct"
-LLM_STAGE1_MAX_TOKENS = 2000
+LLM_STAGE1_MAX_TOKENS = 3000    # raised from 2000 — complex notebooks need room
 
 # Stage 2 — unified RAG document (quality-optimised)
-LLM_STAGE2_ENDPOINT   = "databricks-meta-llama-3-1-405b-instruct"
+LLM_STAGE2_ENDPOINT   = "databricks-claude-3-5-sonnet"   # 405B retired Feb 2026
 LLM_STAGE2_MAX_TOKENS = 8000
 
 # Shared
@@ -107,7 +107,7 @@ LLM_RETRY_LIMIT   = 3
 LLM_RETRY_BACKOFF = 2.0
 
 # ── Processing Config ─────────────────────────────────────────────────────────
-MAX_CODE_CHARS     = 20_000
+MAX_CODE_CHARS     = 40_000    # raised from 20_000 — 70B has 128K context, use it
 MAX_PARALLEL_CALLS = 4
 
 log.info("Config loaded for source: %s", source)
@@ -273,69 +273,102 @@ Source System : {source}
 Notebook Name : {name}
 Notebook Path : {path}
 
-Extract and document the following. Be exhaustive — do not skip anything.
-Always use the exact names from the code (table names, column names, function names, variable names).
+Your output will feed a RAG knowledge base that powers an engineering chatbot.
+COMPLETENESS IS CRITICAL — missing a transformation or column means the chatbot
+cannot answer questions about it. Do not summarise, skip, or generalise.
+
+Always use exact names from the code: table names, column names, function names,
+variable names, hardcoded values. Never say "the column" — always say the column name.
 
 ---
 
 **1. NOTEBOOK PURPOSE**
-One precise sentence describing what this notebook does and why it exists.
+One precise sentence. Name the notebook, name what it does, name the source system.
 
 **2. DATA LAYER**
-Which layer does this notebook belong to? (Landing / Raw / EUH / Curated)
-Why does it belong there?
+Which layer? (Landing / Raw / EUH / Curated). Why?
 
 **3. INPUTS**
-List every data source read:
-- Table/file/API name (exact name as in code)
-- Format (Delta, Parquet, API, etc.)
-- Key columns used
+For EVERY data source read, list:
+- Exact table/file/API name (as it appears in the code)
+- Format (Delta, Parquet, REST API, etc.)
+- Every column referenced from this source (list them all)
 
 **4. OUTPUTS**
-List every table or file written:
-- Table/file name (exact name as in code)
-- Format
-- Write mode (overwrite, append, merge)
-- Key columns written
+For EVERY table or file written, list:
+- Exact table/file name (as it appears in the code)
+- Format and write mode (overwrite / append / merge / upsert)
+- Every column written (list them all with data types if castable from code)
 
-**5. TRANSFORMATIONS (step by step)**
-List every transformation in execution order:
-- Step name
-- What it does
-- Columns involved
-- Business reason (if inferrable)
+**5. COLUMN-LEVEL TRANSFORMATION LOGIC**
+This is the most important section. For EVERY column that is created, renamed,
+cast, enriched, derived, or conditionally set — document it as:
 
-**6. BUSINESS LOGIC & RULES**
-Document every business rule embedded in the code:
-- Conditions, thresholds, filters with their exact values
-- Deduplication keys and strategies
-- Join conditions and their purpose
-- Any hardcoded values (IDs, statuses, dates) and what they mean
+  Column: <exact_column_name>
+  Source: <where it comes from — input column name, expression, or constant>
+  Logic: <exact transformation applied — cast, concat, coalesce, condition, formula>
+  Business meaning: <what this column represents in business terms>
 
-**7. ERROR HANDLING & DATA QUALITY**
-- How are nulls handled?
-- How are duplicates handled?
-- Are there any explicit checks, assertions, or guards?
-- What happens if input data is empty or malformed?
+Do NOT group columns together. Every column gets its own entry.
+Do NOT skip columns that "seem obvious". Include all of them.
 
-**8. DEPENDENCIES**
+**6. TRANSFORMATION STEPS (execution order)**
+List every transformation step in the order it runs:
+  Step N: <function or operation name>
+  Input: <input dataframe/table and key columns>
+  Operation: <exactly what happens — filter condition, join key, dedup key, window spec>
+  Output: <resulting dataframe/table and what changed>
+  Business reason: <why this step exists>
+
+**7. BUSINESS RULES & HARDCODED VALUES**
+For EVERY filter, condition, threshold, or hardcoded value in the code:
+- Exact column name and condition (e.g. `status != 'CANCELLED'`)
+- What this rule excludes or includes
+- Business reason (if inferrable from context)
+
+**8. DEDUPLICATION LOGIC**
+If any deduplication occurs:
+- Exact deduplication key columns (list all)
+- Method used (dropDuplicates, window + row_number, merge, etc.)
+- Which records are kept (first, last, highest value, etc.)
+- What happens to the dropped duplicates
+
+**9. JOIN LOGIC**
+For EVERY join in the code:
+- Left table (exact name)
+- Right table (exact name)
+- Join key column(s) (exact names on both sides)
+- Join type (inner, left, right, cross)
+- Columns brought in from the right table
+- Business reason for this join
+
+**10. ERROR HANDLING & DATA QUALITY**
+- How are nulls handled? Which columns? What is the fallback value?
+- Are there explicit null checks, assertions, or guards?
+- What happens if input data is empty?
+- What happens if a join produces no matches?
+
+**11. DEPENDENCIES**
 - Other notebooks called (exact paths)
-- Shared utilities or functions imported
+- Shared utilities or functions imported (exact module names)
 - External APIs or services called
-- Jobs or clusters expected to run first
+- Tables that must exist before this notebook runs
 
-**9. FAILURE MODES**
-List every realistic way this notebook can fail:
-- Failure scenario name
-- Root cause
-- Symptom (what the error looks like)
+**12. FAILURE MODES**
+For EVERY realistic failure scenario:
+- Failure name
+- Root cause (exact condition that triggers it)
+- Symptom / error message
 - How to detect it
-- How to fix it
+- Step-by-step fix
 
-**10. PERFORMANCE NOTES**
-- Any caching, broadcasting, or repartitioning
+**13. PERFORMANCE NOTES**
+- Any caching, broadcasting, repartitioning, or Z-ordering
+- Approximate data volume (if inferrable)
 - Potential bottlenecks
-- Approximate data volume handled (if inferrable)
+
+IMPORTANT: If the code is cut off or truncated, note exactly where it stops and
+what sections you could not analyse. Do not fabricate content for unseen code.
 
 Code:
 {code}
@@ -355,11 +388,20 @@ def clean_code(raw: str) -> str:
 
 
 def summarize_notebook(path: str, raw_content: str) -> dict:
-    name = path.split("/")[-1]
-    code = clean_code(raw_content)[:MAX_CODE_CHARS]
+    name       = path.split("/")[-1]
+    cleaned    = clean_code(raw_content)
+    truncated  = len(cleaned) > MAX_CODE_CHARS
+    code       = cleaned[:MAX_CODE_CHARS]
 
-    if len(clean_code(raw_content)) > MAX_CODE_CHARS:
-        log.warning("Notebook '%s' truncated to %d chars", name, MAX_CODE_CHARS)
+    if truncated:
+        log.warning(
+            "Notebook '%s' truncated: %d → %d chars (~%d%% of code analysed). "
+            "Transformation logic in later cells may be incomplete.",
+            name, len(cleaned), MAX_CODE_CHARS,
+            int(MAX_CODE_CHARS / len(cleaned) * 100),
+        )
+        # Append a truncation marker so the LLM knows to flag incomplete sections
+        code += "\n\n# [TRUNCATED — remaining code not shown. Note this in your output.]"
 
     prompt = NOTEBOOK_SUMMARY_PROMPT.format(
         source=source.title(),
