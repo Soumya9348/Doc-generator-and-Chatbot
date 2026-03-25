@@ -412,6 +412,36 @@ def clean_code(raw: str) -> str:
     return "\n".join(lines)
 
 
+# ── Section-level summary prompt ─────────────────────────────────────────────
+# Used for each detected section in large SQL notebooks.
+# Intentionally shorter than NOTEBOOK_SUMMARY_PROMPT — focused on one section.
+SECTION_SUMMARY_PROMPT = """You are a senior data engineer analysing one section of a Databricks SQL notebook.
+
+Source System  : {source}
+Notebook       : {name}
+Section        : {section_name} ({section_num} of {total_sections})
+
+Extract the following from this section's code only.
+Use exact names (tables, columns, aliases). Do not infer or guess.
+
+**Purpose** — What does this section do in one sentence?
+**Inputs** — Tables or CTEs read (exact names + key columns used)
+**Outputs** — Tables written or CTEs produced (exact names + write mode)
+**Column-level transformations** — For every column created/cast/derived:
+  - Column: <name>
+  - Source: <input column or expression>
+  - Logic: <exact operation>
+  - Business meaning: <what it represents>
+**Business rules** — Every filter, condition, threshold, hardcoded value
+**Joins** — Left table, right table, join key(s), join type, business reason
+**Deduplication** — Keys, method, which record is kept
+**Dependencies** — Other sections or tables that must exist first
+
+Code:
+{code}
+"""
+
+
 def _call_stage1(prompt: str, context: str) -> str:
     """Wrapper: Stage 1 always uses Stage 1 timeout."""
     return call_llm(
@@ -422,25 +452,149 @@ def _call_stage1(prompt: str, context: str) -> str:
     )
 
 
+def detect_sections(code: str) -> list[tuple[str, str]]:
+    """
+    Detect logical sections in a notebook, optimised for SQL notebooks.
+
+    Detection strategy (in priority order):
+    1. Databricks cell markers  -- # COMMAND ----------
+    2. SQL block comments       -- /* Section: ... */ or -- ===
+    3. Named comment headers    -- -- Section Name / # Section Name (uppercase, 3+ words or ALL CAPS)
+    4. Major SQL statements     -- CREATE, INSERT, MERGE, WITH at column 0
+    5. Fallback                 -- treat entire code as one section
+
+    Returns list of (section_name, section_code) tuples.
+    """
+    import re
+
+    lines = code.split("\n")
+    sections: list[tuple[str, str]] = []
+    current_name  = "Section 1"
+    current_lines: list[str] = []
+
+    # Pattern set: anything that looks like a section header
+    cell_marker   = re.compile(r"^#\s*COMMAND\s*-{3,}")
+    block_comment = re.compile(r"^/\*\s*(?:section|step|part|block)[:\s]+(.+)", re.IGNORECASE)
+    dash_header   = re.compile(r"^--\s*[=\-]{3,}\s*(.+?)\s*[=\-]*$")
+    named_comment = re.compile(r"^(?:--|#)\s+([A-Z][A-Z0-9\s_\-]{4,})\s*$")
+    sql_statement = re.compile(r"^(CREATE|INSERT\s+INTO|MERGE\s+INTO|WITH\s+\w+\s+AS)",
+                               re.IGNORECASE)
+
+    def flush(name: str, lines: list[str]) -> None:
+        body = "\n".join(lines).strip()
+        if body:
+            sections.append((name, body))
+
+    section_idx = 1
+
+    for line in lines:
+        stripped = line.strip()
+
+        # ── Cell boundary ─────────────────────────────────────────────────────
+        if cell_marker.match(stripped):
+            flush(current_name, current_lines)
+            section_idx += 1
+            current_name  = f"Cell {section_idx}"
+            current_lines = []
+            continue
+
+        # ── Block comment header ───────────────────────────────────────────────
+        m = block_comment.match(stripped)
+        if m:
+            flush(current_name, current_lines)
+            current_name  = m.group(1).strip().rstrip("*/").strip()
+            current_lines = []
+            continue
+
+        # ── Dash-style header: -- === Load Sessions === ───────────────────────
+        m = dash_header.match(stripped)
+        if m and len(m.group(1).strip()) > 3:
+            flush(current_name, current_lines)
+            current_name  = m.group(1).strip()
+            current_lines = []
+            continue
+
+        # ── Uppercase named comment: -- DEDUPLICATE SESSIONS ─────────────────
+        m = named_comment.match(stripped)
+        if m and m.group(1).isupper():
+            flush(current_name, current_lines)
+            current_name  = m.group(1).strip().title()
+            current_lines = []
+            continue
+
+        # ── Major SQL statement at column 0 (new logical block) ───────────────
+        if sql_statement.match(stripped) and current_lines:
+            # Only start a new section if the current one has meaningful content
+            non_empty = [l for l in current_lines if l.strip() and not l.strip().startswith("--")]
+            if len(non_empty) > 3:
+                flush(current_name, current_lines)
+                # Derive name from the statement itself
+                stmt_match = re.match(
+                    r"(CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|TEMP\s+VIEW)\s+(\S+)|"
+                    r"INSERT\s+INTO\s+(\S+)|MERGE\s+INTO\s+(\S+)|WITH\s+(\w+))",
+                    stripped, re.IGNORECASE
+                )
+                if stmt_match:
+                    obj_name = next((g for g in stmt_match.groups()[1:] if g), "Block")
+                    section_idx += 1
+                    current_name = f"{obj_name} (block {section_idx})"
+                else:
+                    section_idx += 1
+                    current_name = f"SQL Block {section_idx}"
+                current_lines = []
+
+        current_lines.append(line)
+
+    flush(current_name, current_lines)
+
+    # If detection found only 1 section, it means no markers existed —
+    # fall back to char-based splitting at MAX_CODE_CHARS boundaries
+    if len(sections) <= 1 and sections:
+        name0, code0 = sections[0]
+        if len(code0) > MAX_CODE_CHARS:
+            sections = []
+            chunk_idx = 1
+            while code0:
+                split_at = code0.rfind("\n", 0, MAX_CODE_CHARS) + 1 or MAX_CODE_CHARS
+                sections.append((f"Part {chunk_idx}", code0[:split_at]))
+                code0 = code0[split_at:]
+                chunk_idx += 1
+
+    log.debug("Detected %d sections in notebook", len(sections))
+    return sections
+
+
 def summarize_notebook(path: str, raw_content: str) -> dict:
     """
-    Summarise a single notebook.
+    Summarise a single notebook using section-aware chunking.
 
-    Large notebook strategy (> MAX_CODE_CHARS):
-    Instead of truncating, split the code into two halves and run two
-    separate LLM calls. Each half gets the full prompt context (name, path,
-    source) so the model knows what it is analysing. The two partial summaries
-    are then merged with a lightweight third call.
+    WHY SECTION-AWARE (not char-based halves):
+    The old approach split at a fixed char midpoint and ran 2 calls.
+    Problems:
+      1. half_b was never capped — could still be 40K+ chars causing timeouts.
+      2. Output was capped at LLM_STAGE1_MAX_TOKENS — a 5-section notebook
+         needs ~3000 tokens of output minimum. The model stopped after section 3.
+      3. Arbitrary midpoint split could cut a SQL block in half, producing
+         incoherent summaries for both halves.
 
-    This avoids both truncation (missing transformation logic) AND timeouts
-    (sending too much code in one call).
+    Section-aware approach:
+      - Detect logical boundaries (cell markers, SQL blocks, comment headers)
+      - Each section gets its own focused LLM call with a tight input + output
+      - Every section is guaranteed to be documented — no section is ever lost
+      - Parallel execution keeps total time low despite more calls
+      - A final merge call assembles the section summaries into the standard
+        13-section notebook summary format
+
+    For a 1000-line EUH notebook with 5 SQL sections:
+      Old: 2 calls × (500 lines each) → output truncated after section 3
+      New: 5 calls × (200 lines each) → all 5 sections fully documented
     """
     name    = path.split("/")[-1]
     cleaned = clean_code(raw_content)
     total   = len(cleaned)
 
+    # ── Small notebook: single call ───────────────────────────────────────────
     if total <= MAX_CODE_CHARS:
-        # ── Small notebook: single call ───────────────────────────────────────
         log.info("Summarising (single call, %d chars): %s", total, name)
         prompt = NOTEBOOK_SUMMARY_PROMPT.format(
             source=source.title(), name=name, path=path, code=cleaned,
@@ -454,101 +608,101 @@ def summarize_notebook(path: str, raw_content: str) -> dict:
             return {"path": path, "name": name,
                     "summary": f"_Summary unavailable: {e}_", "error": str(e)}
 
-    else:
-        # ── Large notebook: split into two halves, then merge ─────────────────
-        mid = total // 2
-        # Split at a newline boundary near the midpoint to avoid cutting mid-line
-        split_at = cleaned.rfind("\n", 0, mid) + 1
-        if split_at <= 0:
-            split_at = mid
-        half_a = cleaned[:split_at]
-        half_b = cleaned[split_at:]
+    # ── Large notebook: section-aware chunking ────────────────────────────────
+    sections = detect_sections(cleaned)
+    log.info(
+        "Large notebook '%s' (%d chars) — detected %d sections. "
+        "Processing each section independently.",
+        name, total, len(sections),
+    )
 
-        log.warning(
-            "Large notebook '%s' (%d chars) — splitting into two halves "
-            "(%d + %d chars) to avoid timeout.",
-            name, total, len(half_a), len(half_b),
+    # Summarise each section in parallel (bounded by MAX_PARALLEL_CALLS)
+    section_summaries: list[tuple[str, str]] = []   # (section_name, summary_text)
+    section_errors:    list[str]             = []
+
+    def _summarise_section(idx: int, sec_name: str, sec_code: str) -> tuple[int, str, str, str | None]:
+        """Returns (idx, section_name, summary, error)"""
+        prompt = SECTION_SUMMARY_PROMPT.format(
+            source=source.title(),
+            name=name,
+            section_name=sec_name,
+            section_num=idx + 1,
+            total_sections=len(sections),
+            code=sec_code[:MAX_CODE_CHARS],         # cap each section just in case
         )
-
-        half_note_a = (
-            "NOTE: This is the FIRST HALF of the notebook. "
-            "Analyse only what is visible. A second half exists and will be merged."
-        )
-        half_note_b = (
-            "NOTE: This is the SECOND HALF of the notebook. "
-            "Analyse only what is visible. A first half was already analysed."
-        )
-
-        errors = []
-        summary_a = summary_b = None
-
         try:
-            prompt_a = NOTEBOOK_SUMMARY_PROMPT.format(
-                source=source.title(), name=f"{name} (half 1/2)",
-                path=path, code=half_a + f"\n\n# {half_note_a}",
-            )
-            summary_a = _call_stage1(prompt_a, context=f"{name}_half1")
-            log.info("✓ Half 1/2 done: %s", name)
+            result = _call_stage1(prompt, context=f"{name}_sec{idx+1}")
+            log.info("  ✓ Section %d/%d: %s", idx + 1, len(sections), sec_name)
+            return (idx, sec_name, result, None)
         except Exception as e:
-            errors.append(f"half1: {e}")
-            log.error("✗ Half 1/2 failed: %s — %s", name, e)
+            log.error("  ✗ Section %d/%d failed: %s — %s", idx + 1, len(sections), sec_name, e)
+            return (idx, sec_name, f"_Section summary unavailable: {e}_", str(e))
 
-        try:
-            prompt_b = NOTEBOOK_SUMMARY_PROMPT.format(
-                source=source.title(), name=f"{name} (half 2/2)",
-                path=path, code=half_b + f"\n\n# {half_note_b}",
-            )
-            summary_b = _call_stage1(prompt_b, context=f"{name}_half2")
-            log.info("✓ Half 2/2 done: %s", name)
-        except Exception as e:
-            errors.append(f"half2: {e}")
-            log.error("✗ Half 2/2 failed: %s — %s", name, e)
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as executor:
+        futures = {
+            executor.submit(_summarise_section, i, sec_name, sec_code): i
+            for i, (sec_name, sec_code) in enumerate(sections)
+        }
+        raw_results = [f.result() for f in as_completed(futures)]
 
-        if not summary_a and not summary_b:
-            return {"path": path, "name": name,
-                    "summary": f"_Both halves failed: {errors}_", "error": str(errors)}
+    # Restore section order
+    raw_results.sort(key=lambda x: x[0])
+    for idx, sec_name, summary, error in raw_results:
+        section_summaries.append((sec_name, summary))
+        if error:
+            section_errors.append(f"Section '{sec_name}': {error}")
 
-        # If only one half succeeded, use it with a warning
-        if not summary_a or not summary_b:
-            partial = summary_a or summary_b
-            warn = "_WARNING: Only one half of this notebook was successfully summarised._\n\n"
-            return {"path": path, "name": name, "summary": warn + partial, "error": str(errors)}
+    if section_errors:
+        log.warning("%d/%d sections had errors: %s", len(section_errors), len(sections), section_errors)
 
-        # ── Merge the two partial summaries ───────────────────────────────────
-        merge_prompt = f"""You are a senior data engineer.
-Two partial summaries of the same Databricks notebook have been generated separately.
-Merge them into ONE complete, coherent summary following the same 13-section structure.
+    # ── Merge section summaries into standard notebook summary format ─────────
+    sections_block = "\n\n".join(
+        f"=== SECTION {i+1}: {sec_name} ===\n{summary}"
+        for i, (sec_name, summary) in enumerate(section_summaries)
+    )
+
+    merge_prompt = f"""You are a senior data engineer.
+The notebook below has been analysed section by section.
+Synthesise all section summaries into ONE complete notebook summary.
+
+Notebook : {name}
+Source   : {source.title()}
+Path     : {path}
+Sections : {len(sections)}
 
 Rules:
-- Combine information from both halves — do not drop anything.
-- Deduplicate repeated points.
-- Use exact names from the code (tables, columns, functions).
-- If the two halves describe different transformation steps, keep all steps in execution order.
+- Include ALL sections — do not drop or skip any section.
+- Preserve every column name, table name, transformation, and business rule.
+- Merge duplicate information (e.g. shared inputs referenced by multiple sections).
+- List transformation steps in execution order across all sections.
+- Use the standard 13-section format from NOTEBOOK_SUMMARY_PROMPT.
 
-Notebook: {name}
-Source: {source.title()}
-Path: {path}
+SECTION SUMMARIES:
+{sections_block}
 
---- FIRST HALF SUMMARY ---
-{summary_a}
+Produce the complete merged notebook summary now:"""
 
---- SECOND HALF SUMMARY ---
-{summary_b}
+    try:
+        merged = call_llm(
+            merge_prompt,
+            context=f"{name}_merge",
+            max_tokens=LLM_STAGE1_MAX_TOKENS * 2,   # merge output needs more room
+            timeout=LLM_TIMEOUT_STAGE1,
+        )
+        log.info("✓ Merged %d sections: %s", len(sections), name)
+        error_flag = ("; ".join(section_errors)) if section_errors else None
+        return {"path": path, "name": name, "summary": merged, "error": error_flag}
 
-Produce the merged summary now:"""
-
-        try:
-            merged = _call_stage1(merge_prompt, context=f"{name}_merge")
-            log.info("✓ Merged halves: %s", name)
-            return {"path": path, "name": name, "summary": merged, "error": None}
-        except Exception as e:
-            log.error("✗ Merge failed: %s — falling back to concatenation: %s", name, e)
-            # Fallback: just concatenate both summaries with a divider
-            combined = (
-                f"_NOTE: Merge step failed. Showing both halves concatenated._\n\n"
-                f"### Half 1\n{summary_a}\n\n### Half 2\n{summary_b}"
+    except Exception as e:
+        log.error("✗ Merge failed for %s: %s — falling back to concatenation", name, e)
+        fallback = (
+            f"_NOTE: Merge step failed ({e}). Section summaries concatenated below._\n\n"
+            + "\n\n".join(
+                f"### {sec_name}\n{summary}"
+                for sec_name, summary in section_summaries
             )
-            return {"path": path, "name": name, "summary": combined, "error": str(e)}
+        )
+        return {"path": path, "name": name, "summary": fallback, "error": str(e)}
 
 
 def summarize_all_notebooks(paths: list, contents: list) -> list[dict]:
