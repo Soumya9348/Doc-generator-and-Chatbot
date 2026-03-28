@@ -1,236 +1,252 @@
--- ============================================================================
--- DATABRICKS ADVANCED OPTIMIZED QUERY — ecomovement tariff pipeline
--- ============================================================================
--- Techniques used:
---   [A] Higher-order functions (TRANSFORM, FILTER, AGGREGATE) to avoid EXPLODE
---   [B] /*+ BROADCAST */ hint for dimension table join
---   [C] /*+ SHUFFLE_HASH */ hint to force hash join over sort-merge
---   [D] ARRAY_AGG + STRUCT packing to minimize shuffles
---   [E] Early predicate pushdown with higher-order FILTER
---   [F] Skew hint for uneven partition distributions
---   [G] MERGE INTO for incremental upsert (commented, for scheduled runs)
--- ============================================================================
-
 WITH deduplicate_tariff AS (
-  SELECT
-    id,
-    price_list,
-    source,
-    ingest_timestamp
-  FROM `raw-emob-datahub`.ecomovement_api_tariffs
-  WHERE ingest_timestamp >= DATEADD(DAY, -2, CURRENT_DATE())
-  QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY id
-    ORDER BY ingest_timestamp DESC, source_file_ingest_timestamp DESC
-  ) = 1
-),
 
--- ==========================================================================
--- [A] HIGHER-ORDER FUNCTIONS: Process nested arrays WITHOUT exploding
--- Use TRANSFORM + FILTER to manipulate elements in-place, avoiding row
--- multiplication and the shuffle it causes.
--- ==========================================================================
--- Instead of EXPLODE(FROM_JSON(price_list)) → N rows per tariff,
--- we keep arrays as arrays and only explode at the final step when needed.
+  SELECT
+
+    id,
+
+    price_list,
+
+    source,
+
+    ingest_timestamp
+
+  FROM `raw-emob-datahub`.ecomovement_api_tariffs
+
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY ingest_timestamp DESC, source_file_ingest_timestamp DESC) = 1
+
+),
 
 raw_tariff AS (
+
   SELECT
+
     id,
+
     price,
+
     source,
+
     ingest_timestamp
+
   FROM deduplicate_tariff
-  LATERAL VIEW EXPLODE(
-    FROM_JSON(
-      price_list,
-      'ARRAY<STRUCT<elements: ARRAY<STRUCT<price_excl_vat: STRING, type: STRING, vat: STRING>>, partner: STRING, product: STRUCT<currency: STRING, description: STRING, name: STRING, subscription_fee_excl_vat: STRING, subscription_type: STRING>>>'
-    )
-  ) AS price
+
+  LATERAL VIEW EXPLODE(FROM_JSON(price_list, 'ARRAY<STRUCT<elements: ARRAY<STRUCT<price_excl_vat: STRING, type: STRING, vat: STRING>>, partner: STRING, product: STRUCT<currency: STRING, description: STRING, name: STRING, subscription_fee_excl_vat: STRING, subscription_type: STRING>>>')) AS price
+
 ),
 
--- ==========================================================================
--- [A] AVOID EXPLODE for locations — use MAX_BY (aggregate, no sort/shuffle)
--- MAX_BY returns the value associated with the max of another column,
--- effectively doing "latest row per ID" without ROW_NUMBER.
--- ==========================================================================
 distinct_raw_locations AS (
+
   SELECT *
-  FROM `raw-emob-datahub`.ecomovement_api_locations
-  WHERE ingest_timestamp >= DATEADD(DAY, -2, CURRENT_DATE())
-  QUALIFY ROW_NUMBER() OVER (
-    PARTITION BY id
-    ORDER BY ingest_timestamp DESC
-  ) = 1
+
+  FROM (
+
+    SELECT rcl.*,
+
+      ROW_NUMBER() OVER (
+
+        PARTITION BY rcl.id ORDER BY rcl.ingest_timestamp DESC
+
+      ) AS row_num
+
+    FROM `raw-emob-datahub`.ecomovement_api_locations rcl
+
+  ) r
+
+  WHERE r.row_num = 1
+
 ),
 
--- ==========================================================================
--- [A] HIGHER-ORDER FUNCTION: Use TRANSFORM to parse EVSE JSON in-place
--- and FILTER to pre-filter connectors with pricing_id before exploding.
--- This avoids the double-EXPLODE pattern entirely.
--- ==========================================================================
-evse_with_parsed_connectors AS (
+-- OPT: POSEXPLODE gives array index for free — removes one ROW_NUMBER window function
+evse_explode AS (
+
   SELECT
     raw.id AS source_location_id,
-    POSEXPLODE(
-      FROM_JSON(
-        raw.evses,
-        'ARRAY<STRUCT<uid: STRING, status: STRING, capabilities: ARRAY<STRING>, connectors: ARRAY<STRING>, last_updated: STRING, physical_reference: STRING, evse_id: STRING>>'
-      )
-    ) AS (evse_pos, e)
+
+    CONCAT(
+      raw.id, '_',
+      CAST(pos + 1 AS STRING)
+    ) AS source_evse_id,
+
+    e.*
+
   FROM distinct_raw_locations raw
+
+  LATERAL VIEW POSEXPLODE(FROM_JSON(raw.evses,
+
+    'ARRAY<STRUCT<uid: STRING, status: STRING, capabilities: ARRAY<STRING>, connectors: ARRAY<STRING>, last_updated: STRING, physical_reference: STRING, evse_id: STRING>>')) evse AS pos, e
+
 ),
 
--- [A] Use TRANSFORM to parse each connector JSON string into a struct
--- and FILTER to keep only connectors with non-null pricing_id
--- ALL IN ONE PASS — no EXPLODE needed for this step
-evse_explode AS (
+-- OPT: TRANSFORM + FILTER + FLATTEN — parse & filter connectors INSIDE the array before exploding
+-- This avoids the double LATERAL EXPLODE and eliminates rows with NULL pricing_id before they materialize
+connector_explode AS (
+
   SELECT
     source_location_id,
-    CONCAT(source_location_id, '_', CAST(evse_pos + 1 AS STRING)) AS source_evse_id,
-    e.uid,
-    e.status,
-    -- [A][E] TRANSFORM + FILTER: parse connectors AND filter nulls in one array pass
+
+    source_evse_id,
+
+    '${source}' AS source,
+
+    CONCAT(
+      source_evse_id, '_',
+      ROW_NUMBER() OVER(
+        PARTITION BY source_evse_id ORDER BY v.id
+      )
+    ) AS source_connector_id,
+
+    v.*
+
+  FROM evse_explode e
+
+  LATERAL VIEW EXPLODE(
     FILTER(
       FLATTEN(
         TRANSFORM(
           e.connectors,
-          c -> FROM_JSON(
-            c,
-            'ARRAY<STRUCT<id: STRING, standard: STRING, format: STRING, power_type: STRING, voltage: STRING, amperage: STRING, last_updated: STRING, pricing_id: STRING, max_power: STRING>>'
-          )
+          c -> FROM_JSON(c, 'ARRAY<STRUCT<id: STRING, standard: STRING, format: STRING, power_type: STRING, voltage: STRING, amperage: STRING, last_updated: STRING, pricing_id: STRING, max_power: STRING>>')
         )
       ),
-      connector -> connector.pricing_id IS NOT NULL  -- [E] pushdown: filter BEFORE explode
-    ) AS parsed_connectors
-  FROM evse_with_parsed_connectors
+      x -> x.pricing_id IS NOT NULL
+    )
+  ) tbl AS v
+
 ),
 
--- Now explode only the pre-filtered, pre-parsed connectors (much fewer rows)
-connector_explode AS (
-  SELECT
-    source_location_id,
-    source_evse_id,
-    '${source}' AS source,
-    CONCAT(
-      source_evse_id, '_',
-      CAST(ROW_NUMBER() OVER (PARTITION BY source_evse_id ORDER BY v.id) AS STRING)
-    ) AS source_connector_id,
-    v.*
-  FROM evse_explode
-  LATERAL VIEW EXPLODE(parsed_connectors) AS v
-  WHERE SIZE(parsed_connectors) > 0  -- skip EVSEs with no valid connectors
-),
-
--- ==========================================================================
--- [D] STRUCT PACKING: Select only needed columns to minimize shuffle payload
--- ==========================================================================
 connector_remove_dups AS (
-  SELECT DISTINCT
-    source_location_id,
-    source_evse_id,
-    source,
-    source_connector_id,
-    id,
-    standard,
-    format,
-    power_type,
-    voltage,
-    amperage,
-    last_updated,
-    pricing_id,
-    max_power
-  FROM connector_explode
+
+  SELECT *
+
+  FROM (
+
+    SELECT c.*,
+
+      ROW_NUMBER() OVER(
+
+        PARTITION BY c.source_connector_id,
+
+          c.source_evse_id ORDER BY c.source_connector_id,
+
+          c.source_evse_id
+
+      ) AS row_num
+
+    FROM connector_explode c
+
+  ) r
+
+  WHERE r.row_num = 1
+
 ),
 
--- ==========================================================================
--- [B] BROADCAST HINT: Force broadcast join if charger_connector is < 8GB
--- This eliminates the shuffle on the large connector side entirely.
--- [F] SKEW HINT: Handle skewed source values if some sources dominate.
--- ==========================================================================
+-- OPT: BROADCAST hint — broadcasts smaller charger_connector table to all nodes, eliminates shuffle
+-- OPT: SKEW hint — handles skewed source values to prevent executor hotspots
 connector_tariff_id AS (
+
   SELECT /*+ BROADCAST(cc), SKEW('cc', 'source') */
+
     c.source,
+
     cc.connector_id,
+
     c.pricing_id AS source_tariff_id
+
   FROM connector_remove_dups c
+
   INNER JOIN `euh-emobility`.charger_connector cc
-    ON c.source_connector_id = cc.source_connector_id
-    AND cc.source = c.source
+
+    ON c.source_connector_id = cc.source_connector_id AND cc.source = c.source
+
+  -- OPT: pricing_id IS NOT NULL filter moved earlier into connector_explode via FILTER()
+
 ),
 
 processed_tariff AS (
+
   SELECT
+
     id AS source_tariff_id,
+
     price.product.currency AS currency,
+
     price.product.description AS value_string,
+
     'All' AS payment_method,
+
     ARRAY("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY") AS day,
+
     element.type AS type,
+
     CASE
+
       WHEN element.type = 'ENERGY' THEN 'kWh'
-      WHEN element.type = 'TIME'   THEN 'sec'
-      WHEN element.type = 'FLAT'   THEN price.product.currency
+
+      WHEN element.type = 'TIME' THEN 'sec'
+
+      WHEN element.type = 'FLAT' THEN price.product.currency
+
       ELSE NULL
+
     END AS unit,
+
     CASE
+
       WHEN element.type = 'ENERGY' THEN 1
-      WHEN element.type = 'TIME'   THEN 60
+
+      WHEN element.type = 'TIME' THEN 60
+
       ELSE NULL
+
     END AS value_numeric,
+
     CAST(element.price_excl_vat AS DECIMAL(5,2)) AS net_cost,
+
     CAST(element.vat AS DECIMAL(5,2)) AS vat,
-    CAST(
-      CAST(element.price_excl_vat AS DECIMAL(5,2)) * (1 + (CAST(element.vat AS DECIMAL(5,2)) / 100))
-      AS DECIMAL(5,2)
-    ) AS gross_cost,
+
+    CAST(CAST(element.price_excl_vat AS DECIMAL(5,2)) * (1 + (CAST(element.vat AS DECIMAL(5,2)) / 100)) AS DECIMAL(5,2)) AS gross_cost,
+
     NULL AS start_time,
     NULL AS end_time,
+
     price.product.subscription_fee_excl_vat AS metric_string_1,
+
     NULL AS metric_string_2,
-    CONCAT(
-      '{"subscription_fee_excl_vat":"', COALESCE(price.product.subscription_fee_excl_vat, ''), '",',
-      '"subscription_type":"', COALESCE(price.product.subscription_type, ''), '",',
-      '"partner":"', COALESCE(price.partner, ''), '"}'
-    ) AS metric_string_3,
+
+    CONCAT('{"subscription_fee_excl_vat":"', price.product.subscription_fee_excl_vat, '",',
+      '"subscription_type":"', price.product.subscription_type, '",',
+      '"partner":"', price.partner, '"}')
+    AS metric_string_3,
+
     CURRENT_TIMESTAMP() AS created,
+
     CURRENT_TIMESTAMP() AS modified,
+
     ingest_timestamp AS processed,
+
     source
+
   FROM raw_tariff
+
   LATERAL VIEW EXPLODE(price.elements) AS element
+
 ),
 
--- ==========================================================================
--- [C] SHUFFLE_HASH HINT: Force hash-based join instead of sort-merge.
--- Hash joins are faster when neither side is small enough to broadcast.
--- ==========================================================================
+-- OPT: SHUFFLE_HASH hint — forces hash join over sort-merge, skips expensive sort
 result AS (
+
   SELECT /*+ SHUFFLE_HASH(c) */
     c.connector_id, pt.*
+
   FROM processed_tariff AS pt
+
   INNER JOIN connector_tariff_id AS c
+
     ON c.source_tariff_id = pt.source_tariff_id
+
 )
 
--- ==========================================================================
--- [A] MAX_BY AGGREGATE: Avoids the 7-column ROW_NUMBER sort entirely.
--- MAX_BY picks the value corresponding to the max `processed` timestamp.
--- ==========================================================================
 SELECT *
-FROM result
-QUALIFY ROW_NUMBER() OVER (
-  PARTITION BY connector_id, source_tariff_id, type, day, start_time, end_time, metric_string_3
-  ORDER BY processed DESC
-) = 1
 
--- ==========================================================================
--- [G] OPTIONAL: For scheduled runs, use MERGE INTO instead of full overwrite
--- ==========================================================================
--- MERGE INTO gold.ecomovement_tariffs AS target
--- USING (above query) AS source
--- ON target.connector_id = source.connector_id
---    AND target.source_tariff_id = source.source_tariff_id
---    AND target.type = source.type
---    AND target.metric_string_3 = source.metric_string_3
--- WHEN MATCHED AND source.processed > target.processed THEN UPDATE SET *
--- WHEN NOT MATCHED THEN INSERT *
+FROM result
+
+QUALIFY ROW_NUMBER() OVER (PARTITION BY connector_id, source_tariff_id, type, day, start_time, end_time, metric_string_3 ORDER BY processed DESC) = 1
