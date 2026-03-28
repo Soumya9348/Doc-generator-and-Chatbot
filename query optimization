@@ -54,18 +54,13 @@ raw_tariff AS (
 -- effectively doing "latest row per ID" without ROW_NUMBER.
 -- ==========================================================================
 distinct_raw_locations AS (
-  SELECT
-    id,
-    MAX_BY(evses, ingest_timestamp) AS evses,
-    MAX_BY(operator, ingest_timestamp) AS operator,
-    MAX_BY(address, ingest_timestamp) AS address,
-    MAX_BY(city, ingest_timestamp) AS city,
-    MAX_BY(country, ingest_timestamp) AS country,
-    MAX_BY(coordinates, ingest_timestamp) AS coordinates,
-    MAX(ingest_timestamp) AS ingest_timestamp
+  SELECT *
   FROM `raw-emob-datahub`.ecomovement_api_locations
   WHERE ingest_timestamp >= DATEADD(DAY, -2, CURRENT_DATE())
-  GROUP BY id
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY id
+    ORDER BY ingest_timestamp DESC
+  ) = 1
 ),
 
 -- ==========================================================================
@@ -221,30 +216,12 @@ result AS (
 -- [A] MAX_BY AGGREGATE: Avoids the 7-column ROW_NUMBER sort entirely.
 -- MAX_BY picks the value corresponding to the max `processed` timestamp.
 -- ==========================================================================
-SELECT
-  connector_id,
-  source_tariff_id,
-  type,
-  day,
-  start_time,
-  end_time,
-  metric_string_3,
-  MAX_BY(currency, processed)       AS currency,
-  MAX_BY(value_string, processed)   AS value_string,
-  MAX_BY(payment_method, processed) AS payment_method,
-  MAX_BY(unit, processed)           AS unit,
-  MAX_BY(value_numeric, processed)  AS value_numeric,
-  MAX_BY(net_cost, processed)       AS net_cost,
-  MAX_BY(vat, processed)            AS vat,
-  MAX_BY(gross_cost, processed)     AS gross_cost,
-  MAX_BY(metric_string_1, processed) AS metric_string_1,
-  MAX_BY(metric_string_2, processed) AS metric_string_2,
-  MAX(processed)                     AS processed,
-  MAX_BY(source, processed)          AS source,
-  MAX_BY(created, processed)         AS created,
-  MAX_BY(modified, processed)        AS modified
+SELECT *
 FROM result
-GROUP BY connector_id, source_tariff_id, type, day, start_time, end_time, metric_string_3
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY connector_id, source_tariff_id, type, day, start_time, end_time, metric_string_3
+  ORDER BY processed DESC
+) = 1
 
 -- ==========================================================================
 -- [G] OPTIONAL: For scheduled runs, use MERGE INTO instead of full overwrite
