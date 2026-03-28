@@ -1,0 +1,181 @@
+WITH deduplicate_tariff AS (
+  -- OPT: Added incremental filter to avoid full-history scan (adjust lookback as needed)
+  SELECT
+    id,
+    price_list,
+    source,
+    ingest_timestamp
+  FROM `raw-emob-datahub`.ecomovement_api_tariffs
+  WHERE ingest_timestamp >= DATEADD(DAY, -2, CURRENT_DATE())
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY id
+    ORDER BY ingest_timestamp DESC, source_file_ingest_timestamp DESC
+  ) = 1
+),
+
+raw_tariff AS (
+  SELECT
+    id,
+    price,
+    source,
+    ingest_timestamp
+  FROM deduplicate_tariff
+  LATERAL VIEW EXPLODE(
+    FROM_JSON(price_list, 'ARRAY<STRUCT<elements: ARRAY<STRUCT<price_excl_vat: STRING, type: STRING, vat: STRING>>, partner: STRING, product: STRUCT<currency: STRING, description: STRING, name: STRING, subscription_fee_excl_vat: STRING, subscription_type: STRING>>>')
+  ) AS price
+),
+
+-- OPT#2: Replaced ROW_NUMBER dedup with MAX + self-join (hash join, avoids sort)
+distinct_raw_locations AS (
+  SELECT rcl.*
+  FROM `raw-emob-datahub`.ecomovement_api_locations rcl
+  INNER JOIN (
+    SELECT id, MAX(ingest_timestamp) AS max_ts
+    FROM `raw-emob-datahub`.ecomovement_api_locations
+    WHERE ingest_timestamp >= DATEADD(DAY, -2, CURRENT_DATE())
+    GROUP BY id
+  ) latest
+    ON rcl.id = latest.id
+    AND rcl.ingest_timestamp = latest.max_ts
+),
+
+evse_explode AS (
+  SELECT
+    raw.id AS source_location_id,
+    CONCAT(
+      raw.id, '_',
+      ROW_NUMBER() OVER (PARTITION BY raw.id ORDER BY e.uid)
+    ) AS source_evse_id,
+    e.*
+  FROM distinct_raw_locations raw
+  LATERAL VIEW EXPLODE(
+    FROM_JSON(raw.evses, 'ARRAY<STRUCT<uid: STRING, status: STRING, capabilities: ARRAY<STRING>, connectors: ARRAY<STRING>, last_updated: STRING, physical_reference: STRING, evse_id: STRING>>')
+  ) evse AS e
+),
+
+-- OPT#3: Combined double LATERAL EXPLODE into single INLINE + FROM_JSON
+-- OPT#1: Pushed pricing_id IS NOT NULL filter here (was in connector_tariff_id)
+connector_explode AS (
+  SELECT
+    source_location_id,
+    source_evse_id,
+    '${source}' AS source,
+    CONCAT(
+      source_evse_id, '_',
+      ROW_NUMBER() OVER (PARTITION BY source_evse_id ORDER BY v.id)
+    ) AS source_connector_id,
+    v.*
+  FROM evse_explode e
+  LATERAL VIEW INLINE(
+    FLATTEN(
+      TRANSFORM(e.connectors, c -> FROM_JSON(c, 'ARRAY<STRUCT<id: STRING, standard: STRING, format: STRING, power_type: STRING, voltage: STRING, amperage: STRING, last_updated: STRING, pricing_id: STRING, max_power: STRING>>'))
+    )
+  ) AS v
+  WHERE v.pricing_id IS NOT NULL  -- OPT#1: Early filter, eliminates rows before dedup & join
+),
+
+-- OPT#4: Replaced ROW_NUMBER dedup with DISTINCT (hash-based, avoids sort)
+connector_remove_dups AS (
+  SELECT DISTINCT
+    source_location_id,
+    source_evse_id,
+    source,
+    source_connector_id,
+    id,
+    standard,
+    format,
+    power_type,
+    voltage,
+    amperage,
+    last_updated,
+    pricing_id,
+    max_power
+  FROM connector_explode
+),
+
+connector_tariff_id AS (
+  SELECT
+    c.source,
+    cc.connector_id,
+    c.pricing_id AS source_tariff_id
+  FROM connector_remove_dups c
+  INNER JOIN `euh-emobility`.charger_connector cc
+    ON c.source_connector_id = cc.source_connector_id
+    AND cc.source = c.source
+  -- pricing_id IS NOT NULL filter already applied in connector_explode
+),
+
+processed_tariff AS (
+  SELECT
+    id AS source_tariff_id,
+    price.product.currency AS currency,
+    price.product.description AS value_string,
+    'All' AS payment_method,
+    ARRAY("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY") AS day,
+    element.type AS type,
+    CASE
+      WHEN element.type = 'ENERGY' THEN 'kWh'
+      WHEN element.type = 'TIME' THEN 'sec'
+      WHEN element.type = 'FLAT' THEN price.product.currency
+      ELSE NULL
+    END AS unit,
+    CASE
+      WHEN element.type = 'ENERGY' THEN 1
+      WHEN element.type = 'TIME' THEN 60
+      ELSE NULL
+    END AS value_numeric,
+    CAST(element.price_excl_vat AS DECIMAL(5,2)) AS net_cost,
+    CAST(element.vat AS DECIMAL(5,2)) AS vat,
+    CAST(
+      CAST(element.price_excl_vat AS DECIMAL(5,2)) * (1 + (CAST(element.vat AS DECIMAL(5,2)) / 100))
+      AS DECIMAL(5,2)
+    ) AS gross_cost,
+    NULL AS start_time,
+    NULL AS end_time,
+    price.product.subscription_fee_excl_vat AS metric_string_1,
+    NULL AS metric_string_2,
+    CONCAT(
+      '{"subscription_fee_excl_vat":"', price.product.subscription_fee_excl_vat, '",',
+      '"subscription_type":"', price.product.subscription_type, '",',
+      '"partner":"', price.partner, '"}'
+    ) AS metric_string_3,
+    CURRENT_TIMESTAMP() AS created,
+    CURRENT_TIMESTAMP() AS modified,
+    ingest_timestamp AS processed,
+    source
+  FROM raw_tariff
+  LATERAL VIEW EXPLODE(price.elements) AS element
+),
+
+result AS (
+  SELECT c.connector_id, pt.*
+  FROM processed_tariff AS pt
+  INNER JOIN connector_tariff_id AS c
+    ON c.source_tariff_id = pt.source_tariff_id
+)
+
+-- OPT#6: Replaced 7-column QUALIFY ROW_NUMBER with MAX_BY aggregate (hash vs sort)
+SELECT
+  connector_id,
+  source_tariff_id,
+  type,
+  day,
+  start_time,
+  end_time,
+  metric_string_3,
+  MAX_BY(currency, processed) AS currency,
+  MAX_BY(value_string, processed) AS value_string,
+  MAX_BY(payment_method, processed) AS payment_method,
+  MAX_BY(unit, processed) AS unit,
+  MAX_BY(value_numeric, processed) AS value_numeric,
+  MAX_BY(net_cost, processed) AS net_cost,
+  MAX_BY(vat, processed) AS vat,
+  MAX_BY(gross_cost, processed) AS gross_cost,
+  MAX_BY(metric_string_1, processed) AS metric_string_1,
+  MAX_BY(metric_string_2, processed) AS metric_string_2,
+  MAX(processed) AS processed,
+  MAX_BY(source, processed) AS source,
+  MAX_BY(created, processed) AS created,
+  MAX_BY(modified, processed) AS modified
+FROM result
+GROUP BY connector_id, source_tariff_id, type, day, start_time, end_time, metric_string_3
