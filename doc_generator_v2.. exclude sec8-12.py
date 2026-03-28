@@ -96,7 +96,8 @@ NOTEBOOK_ROOT     = "/Workspace"
 #   LLM_ENDPOINT = "databricks-gemini-3-1-flash-lite"  # slightly stronger on long structured output
 
 LLM_ENDPOINT          = "databricks-meta-llama-3-3-70b-instruct"
-LLM_STAGE1_MAX_TOKENS = 3000    # per-notebook summary (or per-half for large notebooks)
+LLM_STAGE1_MAX_TOKENS = 4500    # per-section summary — increased from 3000 for SQL-heavy sections
+LLM_STAGE1_MERGE_MAX_TOKENS = 10000  # merge output — increased from 6500 to preserve 9+ section details
 LLM_STAGE2_MAX_TOKENS = 5000    # per Stage 2 half-doc (called twice)
 
 # Shared
@@ -106,6 +107,7 @@ LLM_RETRY_LIMIT   = 3
 # Timeouts — 70B on large prompts routinely takes 3-5 minutes.
 # Retry wait must also be long: retrying immediately after a 5-min timeout is pointless.
 LLM_TIMEOUT_STAGE1 = 300       # seconds — per-notebook summary call
+LLM_TIMEOUT_STAGE1_MERGE = 420
 LLM_TIMEOUT_STAGE2 = 480       # seconds — unified doc half (bigger prompt + output)
 LLM_RETRY_WAIT     = 30        # seconds — base wait after timeout (doubles each retry)
 
@@ -172,6 +174,63 @@ def export_notebook(path: str) -> Optional[str]:
 
 # COMMAND ----------
 
+NOTEBOOK_SEQUENCE = ("base", "landing", "raw", "euh")
+
+
+def notebook_filename(path: str) -> str:
+    return path.rstrip("/").split("/")[-1].lower()
+
+
+def expected_notebook_names(source: str) -> dict[str, tuple[str, ...]]:
+    """
+    Canonical workflow order for a source:
+      1. {source_without_api}.py
+      2. landing_etl_{source}
+      3. raw_etl_{source}
+      4. euh_etl_{source}
+    """
+    s = source.lower().strip()
+    base = s.replace("_api", "")
+    return {
+        "base": (f"{base}.py", base),
+        "landing": (f"landing_etl_{s}", f"landing_etl_{s}.py"),
+        "raw": (f"raw_etl_{s}", f"raw_etl_{s}.py"),
+        "euh": (f"euh_etl_{s}", f"euh_etl_{s}.py"),
+    }
+
+
+def classify_expected_notebook(path: str, source: str) -> Optional[str]:
+    name = notebook_filename(path)
+    for role, candidates in expected_notebook_names(source).items():
+        if name in candidates:
+            return role
+    return None
+
+
+def notebook_sort_key(path: str, source: str) -> tuple[int, int, int, str]:
+    name = notebook_filename(path)
+    role = classify_expected_notebook(path, source)
+    exact_rank = NOTEBOOK_SEQUENCE.index(role) if role in NOTEBOOK_SEQUENCE else len(NOTEBOOK_SEQUENCE)
+
+    s = source.lower()
+    base = s.replace("_api", "")
+    role_hints = {
+        "base": (base,),
+        "landing": (f"landing_etl_{s}", f"{s}_landing"),
+        "raw": (f"raw_etl_{s}", f"{s}_raw"),
+        "euh": (f"euh_etl_{s}", f"{s}_euh"),
+    }
+
+    inferred_rank = len(NOTEBOOK_SEQUENCE)
+    for idx, role_name in enumerate(NOTEBOOK_SEQUENCE):
+        if any(name.startswith(prefix) for prefix in role_hints[role_name]):
+            inferred_rank = idx
+            break
+
+    py_rank = 0 if name.endswith(".py") else 1
+    return (exact_rank, inferred_rank, py_rank, path.lower())
+
+
 def belongs_to_source(path: str, source: str) -> bool:
     """
     3-tier matching: directory segment → filename prefix → loose substring.
@@ -198,8 +257,72 @@ def belongs_to_source(path: str, source: str) -> bool:
     return False
 
 
+def select_workflow_paths(all_paths: list[str], source: str) -> list[str]:
+    """
+    Prefer the canonical 4-notebook workflow in a fixed order. If none of the
+    exact names exist, fall back to the broad source matcher for compatibility.
+    """
+    expected = expected_notebook_names(source)
+    exact_matches = {role: [] for role in NOTEBOOK_SEQUENCE}
+
+    for path in all_paths:
+        role = classify_expected_notebook(path, source)
+        if role:
+            exact_matches[role].append(path)
+
+    if any(exact_matches.values()):
+        selected = []
+        for role in NOTEBOOK_SEQUENCE:
+            matches = sorted(exact_matches[role], key=lambda p: notebook_sort_key(p, source))
+            if not matches:
+                log.warning(
+                    "Expected %s notebook for source '%s' not found. Expected name(s): %s",
+                    role,
+                    source,
+                    ", ".join(expected[role]),
+                )
+                continue
+
+            chosen = matches[0]
+            selected.append(chosen)
+
+            if len(matches) > 1:
+                log.warning(
+                    "Multiple %s notebook matches found for source '%s'. Using %s",
+                    role,
+                    source,
+                    chosen,
+                )
+
+        ignored = sorted(
+            [p for p in all_paths if belongs_to_source(p, source) and p not in selected],
+            key=lambda p: notebook_sort_key(p, source),
+        )
+        if ignored:
+            log.info(
+                "Ignoring %d non-canonical notebook match(es) for source '%s': %s",
+                len(ignored),
+                source,
+                ignored,
+            )
+
+        return selected
+
+    fallback = sorted(
+        [p for p in all_paths if belongs_to_source(p, source)],
+        key=lambda p: notebook_sort_key(p, source),
+    )
+    if fallback:
+        log.warning(
+            "No exact canonical notebook names found for source '%s'. "
+            "Falling back to broad source matching.",
+            source,
+        )
+    return fallback
+
+
 all_paths      = list_notebooks(NOTEBOOK_ROOT)
-workflow_paths = [p for p in all_paths if belongs_to_source(p, source)]
+workflow_paths = select_workflow_paths(all_paths, source)
 
 if not workflow_paths:
     raise Exception(f"❌ No notebooks found for source '{source}'.")
@@ -218,18 +341,23 @@ def call_llm(
     context: str = "",
     max_tokens: int = LLM_STAGE1_MAX_TOKENS,
     timeout: int = LLM_TIMEOUT_STAGE1,
+    system_prompt: str = "",
 ) -> str:
     """
     Call Databricks model serving with exponential backoff retry.
 
     Args:
-        prompt:     The user prompt.
-        context:    Label for logging (e.g. notebook name).
-        max_tokens: Output token limit.
-        timeout:    HTTP read timeout in seconds. Use LLM_TIMEOUT_STAGE1 (300s)
-                    for notebook summaries and LLM_TIMEOUT_STAGE2 (480s) for
-                    unified doc calls. Do NOT use 120s — 70B on large prompts
-                    regularly takes 3-5 minutes to respond.
+        prompt:        The user prompt.
+        context:       Label for logging (e.g. notebook name).
+        max_tokens:    Output token limit.
+        timeout:       HTTP read timeout in seconds. Use LLM_TIMEOUT_STAGE1 (300s)
+                       for notebook summaries and LLM_TIMEOUT_STAGE2 (480s) for
+                       unified doc calls. Do NOT use 120s — 70B on large prompts
+                       regularly takes 3-5 minutes to respond.
+        system_prompt: System-level instruction. Llama 3.3 70B strongly adheres
+                       to system instructions — use this for role definition and
+                       behavioral rules. The user prompt should contain the task
+                       and data only.
 
     Retry strategy:
         - HTTP 4xx (except 429): non-retryable, raise immediately.
@@ -238,8 +366,18 @@ def call_llm(
           retrying immediately after a 5-minute timeout is pointless.
     """
     url     = f"{WORKSPACE_URL}/serving-endpoints/{LLM_ENDPOINT}/invocations"
+
+    # Build message list — use system+user split when system_prompt is provided.
+    # Llama 3.3 70B uses <|start_header_id|>system<|end_header_id|> and strongly
+    # follows system instructions. This measurably improves instruction adherence
+    # vs putting everything in one user message.
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     payload = {
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": LLM_TEMPERATURE,
         "max_tokens": max_tokens,
     }
@@ -292,18 +430,9 @@ def call_llm(
 # ─────────────────────────────────────────────────────────────────────────────
 
 NOTEBOOK_SUMMARY_PROMPT = """\
-You are a senior data engineer performing a deep technical analysis of a Databricks notebook.
-
 Source System : {source}
 Notebook Name : {name}
 Notebook Path : {path}
-
-Your output will feed a RAG knowledge base that powers an engineering chatbot.
-COMPLETENESS IS CRITICAL — missing a transformation or column means the chatbot
-cannot answer questions about it. Do not summarise, skip, or generalise.
-
-Always use exact names from the code: table names, column names, function names,
-variable names, hardcoded values. Never say "the column" — always say the column name.
 
 ---
 
@@ -336,6 +465,15 @@ cast, enriched, derived, or conditionally set — document it as:
 
 Do NOT group columns together. Every column gets its own entry.
 Do NOT skip columns that "seem obvious". Include all of them.
+
+**5b. SQL MERGE STATEMENT ANALYSIS** (if applicable)
+If the code contains MERGE INTO statements, for each one document:
+- Target table (from MERGE INTO)
+- Source (from USING clause — describe the subquery/CTE)
+- ON condition (every column pair)
+- Every column in UPDATE SET with its source expression
+- Every column in INSERT with its VALUES expression
+Do NOT skip columns. If the SET clause has 30 columns, list all 30.
 
 **6. TRANSFORMATION STEPS (execution order)**
 List every transformation step in the order it runs:
@@ -395,9 +533,26 @@ For EVERY realistic failure scenario:
 IMPORTANT: If the code is cut off or truncated, note exactly where it stops and
 what sections you could not analyse. Do not fabricate content for unseen code.
 
+You MUST print the marker $$END_OUTPUT$$ on its own line after you finish.
+
 Code:
 {code}
 """
+
+NOTEBOOK_SUMMARY_SYSTEM_PROMPT = """\
+You are a senior data engineer performing a deep technical analysis of a Databricks notebook.
+Your output will feed a RAG knowledge base that powers an engineering chatbot.
+
+RULES YOU MUST FOLLOW:
+1. COMPLETENESS IS CRITICAL — missing a transformation or column means the chatbot
+   cannot answer questions about it. Do not summarise, skip, or generalise.
+2. Always use exact names from the code: table names, column names, function names,
+   variable names, hardcoded values. Never say "the column" — always say the column name.
+3. For EVERY column in a MERGE SET or INSERT clause, document it individually.
+   If there are 30 columns, you produce 30 entries. Never say "and other columns".
+4. Your output must be structured with numbered sections exactly as requested.
+5. You MUST finish your output with the marker $$END_OUTPUT$$ on its own line.
+   If your output does not end with this marker, it is considered INCOMPLETE and will be rejected."""
 
 
 def clean_code(raw: str) -> str:
@@ -412,43 +567,143 @@ def clean_code(raw: str) -> str:
     return "\n".join(lines)
 
 
-# ── Section-level summary prompt ─────────────────────────────────────────────
-# Used for each detected section in large SQL notebooks.
-# Intentionally shorter than NOTEBOOK_SUMMARY_PROMPT — focused on one section.
-SECTION_SUMMARY_PROMPT = """You are a senior data engineer analysing one section of a Databricks SQL notebook.
+SECTION_SUMMARY_SYSTEM_PROMPT = """\
+You are a senior data engineer performing EXHAUSTIVE technical extraction from SQL/Spark code.
+Your output feeds a RAG knowledge base. A human will never read the original code again —
+your output IS the only record. If you skip a column or condition, it is permanently lost.
 
-Source System  : {source}
+RULES:
+1. Use EXACT names from code — table names, column names, aliases, values. No paraphrasing.
+2. Every column gets its own entry. Never group columns. Never say "similar to above".
+3. If there are 30 columns in a MERGE SET clause, list all 30. No shortcuts.
+4. Copy filter conditions verbatim from the code.
+5. You MUST finish with $$END_OUTPUT$$ on its own line. Output without this marker is INCOMPLETE."""
+
+SECTION_SUMMARY_PROMPT = """Source System  : {source}
 Notebook       : {name}
 Section        : {section_name} ({section_num} of {total_sections})
 
-Extract the following from this section's code only.
-Use exact names (tables, columns, aliases). Do not infer or guess.
+Analyse the code below and extract ALL of the following.
 
-**Purpose** — What does this section do in one sentence?
-**Inputs** — Tables or CTEs read (exact names + key columns used)
-**Outputs** — Tables written or CTEs produced (exact names + write mode)
-**Column-level transformations** — For every column created/cast/derived:
-  - Column: <name>
-  - Source: <input column or expression>
-  - Logic: <exact operation>
-  - Business meaning: <what it represents>
-**Business rules** — Every filter, condition, threshold, hardcoded value
-**Joins** — Left table, right table, join key(s), join type, business reason
-**Deduplication** — Keys, method, which record is kept
-**Dependencies** — Other sections or tables that must exist first
+━━━━ 1. PURPOSE ━━━━
+One sentence: what does this section do? Name the target table and operation.
+
+━━━━ 2. INPUTS ━━━━
+For EVERY table, CTE, subquery, or temp view read:
+- Exact name (schema.table or CTE alias)
+- Every column referenced from it (list ALL — do not say "etc." or "and others")
+
+━━━━ 3. OUTPUTS ━━━━
+For EVERY table written (MERGE INTO, INSERT INTO, CREATE TABLE):
+- Exact table name (fully qualified)
+- Write mode (merge/insert/overwrite/append)
+- ALL columns written
+
+━━━━ 4. SQL MERGE STATEMENT ANALYSIS ━━━━
+If this section contains a MERGE INTO statement, document ALL of the following:
+
+**Target table:** exact name from `MERGE INTO <table>`
+**Source:** what is in the `USING (...)` clause — subquery, CTE, or table? Describe it.
+
+**Match condition (ON clause):**
+- Every column pair in the ON condition
+- Any additional conditions (e.g. AND target.col = 'value')
+
+**WHEN MATCHED THEN UPDATE SET — list EVERY column:**
+
+Example of expected output format:
+```
+Column: session_id
+Source expression: source.session_id
+Logic: Direct mapping — session identifier carried over from source
+
+Column: last_updated_ts
+Source expression: COALESCE(source.updated_at, current_timestamp())
+Logic: Uses source timestamp if available, falls back to current time
+
+Column: status_code
+Source expression: CASE WHEN source.status = 'ACTIVE' THEN 1 WHEN source.status = 'CANCELLED' THEN 0 ELSE -1 END
+Logic: Maps status string to integer code — ACTIVE=1, CANCELLED=0, unknown=-1
+```
+
+Follow this EXACT format for EVERY column. Do NOT skip any.
+
+**WHEN NOT MATCHED THEN INSERT:**
+- ALL columns in the INSERT column list
+- ALL corresponding VALUES expressions
+- Any additional WHEN conditions
+
+━━━━ 5. CTE / SUBQUERY BREAKDOWN ━━━━
+For EVERY CTE (WITH ... AS) or subquery:
+- CTE name/alias
+- Source tables it reads from
+- ALL columns it selects
+- Filters/WHERE conditions (copy the exact expression)
+- GROUP BY columns (if any)
+- Window functions (PARTITION BY, ORDER BY, function name)
+- Business purpose in one sentence
+
+━━━━ 6. COLUMN-LEVEL TRANSFORMATIONS ━━━━
+For EVERY column created, cast, renamed, derived, or conditionally set:
+  Column: <exact name>
+  Source: <input column, expression, or constant>
+  Logic: <exact transformation — CAST, CONCAT, COALESCE, CASE WHEN, formula>
+  Business meaning: <what this column represents>
+
+Every column gets its own entry. Do NOT group or abbreviate.
+
+━━━━ 7. FILTERS & BUSINESS RULES ━━━━
+For EVERY WHERE, HAVING, CASE WHEN condition, or hardcoded value:
+- Exact condition expression (copy from code)
+- Which rows it includes or excludes
+- Business reason (if inferrable)
+
+━━━━ 8. JOINS ━━━━
+For EVERY JOIN (including inside CTEs):
+- Left table/CTE (exact name)
+- Right table/CTE (exact name)
+- Join key column(s) — exact names on BOTH sides
+- Join type (INNER, LEFT, RIGHT, FULL, CROSS)
+- Columns brought in from the right side
+- Business reason for this join
+
+━━━━ 9. DEDUPLICATION ━━━━
+If any deduplication (ROW_NUMBER, RANK, DISTINCT, dropDuplicates, QUALIFY):
+- Dedup key columns (PARTITION BY columns)
+- Ordering (ORDER BY columns and direction)
+- Which record is kept (first, last, max)
+- Method used
+
+━━━━ 10. DEPENDENCIES ━━━━
+- Tables that must exist before this section runs
+- Other sections or notebooks that feed into this one
+
+You MUST print $$END_OUTPUT$$ on its own line when done.
 
 Code:
 {code}
 """
 
 
-def _call_stage1(prompt: str, context: str) -> str:
+def _call_stage1(prompt: str, context: str, system_prompt: str = "") -> str:
     """Wrapper: Stage 1 always uses Stage 1 timeout."""
     return call_llm(
         prompt,
         context=context,
         max_tokens=LLM_STAGE1_MAX_TOKENS,
         timeout=LLM_TIMEOUT_STAGE1,
+        system_prompt=system_prompt,
+    )
+
+
+def _call_stage1_large(prompt: str, context: str, system_prompt: str = "") -> str:
+    """Wrapper for large SQL sections (MERGE/INSERT): higher tokens + longer timeout."""
+    return call_llm(
+        prompt,
+        context=context,
+        max_tokens=LLM_STAGE1_MAX_TOKENS + 1500,   # extra room for dense column lists
+        timeout=LLM_TIMEOUT_STAGE1_MERGE,
+        system_prompt=system_prompt,
     )
 
 
@@ -600,7 +855,7 @@ def summarize_notebook(path: str, raw_content: str) -> dict:
             source=source.title(), name=name, path=path, code=cleaned,
         )
         try:
-            summary = _call_stage1(prompt, context=name)
+            summary = _call_stage1(prompt, context=name, system_prompt=NOTEBOOK_SUMMARY_SYSTEM_PROMPT)
             log.info("✓ Summarised: %s", name)
             return {"path": path, "name": name, "summary": summary, "error": None}
         except Exception as e:
@@ -620,6 +875,11 @@ def summarize_notebook(path: str, raw_content: str) -> dict:
     section_summaries: list[tuple[str, str]] = []   # (section_name, summary_text)
     section_errors:    list[str]             = []
 
+    def _section_has_merge_or_insert(code: str) -> bool:
+        """Detect if a section contains MERGE INTO or INSERT INTO statements."""
+        upper = code.upper()
+        return "MERGE INTO" in upper or "INSERT INTO" in upper
+
     def _summarise_section(idx: int, sec_name: str, sec_code: str) -> tuple[int, str, str, str | None]:
         """Returns (idx, section_name, summary, error)"""
         prompt = SECTION_SUMMARY_PROMPT.format(
@@ -630,8 +890,17 @@ def summarize_notebook(path: str, raw_content: str) -> dict:
             total_sections=len(sections),
             code=sec_code[:MAX_CODE_CHARS],         # cap each section just in case
         )
+        # Use higher tokens for MERGE/INSERT-heavy sections
+        is_complex = _section_has_merge_or_insert(sec_code)
         try:
-            result = _call_stage1(prompt, context=f"{name}_sec{idx+1}")
+            if is_complex:
+                log.info("  ⚡ Section %d/%d is MERGE/INSERT-heavy, using large call: %s",
+                         idx + 1, len(sections), sec_name)
+                result = _call_stage1_large(prompt, context=f"{name}_sec{idx+1}",
+                                            system_prompt=SECTION_SUMMARY_SYSTEM_PROMPT)
+            else:
+                result = _call_stage1(prompt, context=f"{name}_sec{idx+1}",
+                                      system_prompt=SECTION_SUMMARY_SYSTEM_PROMPT)
             log.info("  ✓ Section %d/%d: %s", idx + 1, len(sections), sec_name)
             return (idx, sec_name, result, None)
         except Exception as e:
@@ -656,38 +925,83 @@ def summarize_notebook(path: str, raw_content: str) -> dict:
         log.warning("%d/%d sections had errors: %s", len(section_errors), len(sections), section_errors)
 
     # ── Merge section summaries into standard notebook summary format ─────────
+    # DESIGN DECISION: With ~30 columns per table and up to 9 MERGE statements,
+    # a single LLM merge call would need to output 270+ column transformations
+    # (~20K+ tokens). No model can reliably do this without truncation.
+    #
+    # Strategy:
+    #   ≤ 4 sections → LLM merge (output fits within token budget)
+    #   ≥ 5 sections → Structured concatenation (zero information loss)
+    #
+    # Stage 2 receives the full detail either way. The concatenated format
+    # is actually BETTER for RAG because each section is self-contained.
+
+    MERGE_SECTION_THRESHOLD = 4   # sections with > this count skip LLM merge
+
+    if len(sections) > MERGE_SECTION_THRESHOLD:
+        log.info(
+            "Large notebook '%s' has %d sections (>%d) — skipping LLM merge to "
+            "preserve all %d section details without truncation.",
+            name, len(sections), MERGE_SECTION_THRESHOLD, len(sections),
+        )
+        structured_summary = (
+            f"# {name} — Complete Section-by-Section Analysis\n\n"
+            f"**Notebook:** {name}\n"
+            f"**Source:** {source.title()}\n"
+            f"**Path:** {path}\n"
+            f"**Total Sections:** {len(sections)}\n\n"
+            + "\n\n---\n\n".join(
+                f"## Section {i+1}: {sec_name}\n\n{summary}"
+                for i, (sec_name, summary) in enumerate(section_summaries)
+            )
+        )
+        error_flag = ("; ".join(section_errors)) if section_errors else None
+        return {"path": path, "name": name, "summary": structured_summary, "error": error_flag}
+
+    # ── Small notebook (≤ MERGE_SECTION_THRESHOLD sections): LLM merge ────────
     sections_block = "\n\n".join(
         f"=== SECTION {i+1}: {sec_name} ===\n{summary}"
         for i, (sec_name, summary) in enumerate(section_summaries)
     )
 
-    merge_prompt = f"""You are a senior data engineer.
-The notebook below has been analysed section by section.
-Synthesise all section summaries into ONE complete notebook summary.
+    merge_prompt = f"""You are a senior data engineer producing the DEFINITIVE technical reference
+for this notebook. Your output will be the ONLY source of truth in a RAG knowledge base.
+If you drop or abbreviate any detail, that information is PERMANENTLY LOST.
 
 Notebook : {name}
 Source   : {source.title()}
 Path     : {path}
 Sections : {len(sections)}
 
-Rules:
-- Include ALL sections — do not drop or skip any section.
-- Preserve every column name, table name, transformation, and business rule.
-- Merge duplicate information (e.g. shared inputs referenced by multiple sections).
-- List transformation steps in execution order across all sections.
-- Use the standard 13-section format from NOTEBOOK_SUMMARY_PROMPT.
+You have {len(sections)} section summaries below. Synthesise them into ONE complete notebook summary.
+
+━━━━ CRITICAL RULES ━━━━
+1. Include ALL {len(sections)} sections — verify you have covered every one.
+2. PRESERVE EVERY column-level transformation. If a section documents 30 columns
+   in a MERGE SET clause, ALL 30 must appear in your output. Do NOT summarise as
+   "and other columns" or "similar transformations".
+3. PRESERVE EVERY join condition, filter, CTE, and business rule verbatim.
+4. Merge only TRUE duplicates (identical table references across sections).
+5. List transformation steps in execution order across all sections.
+6. For MERGE statements: preserve the full target table, source subquery description,
+   ON condition, every UPDATE SET column mapping, and every INSERT column.
+7. Use the standard 13-section format (Purpose, Data Layer, Inputs, Outputs,
+   Column-Level Transformations, Transformation Steps, Business Rules,
+   Deduplication, Joins, Error Handling, Dependencies, Failure Modes, Performance).
+8. This notebook has {len(sections)} MERGE/transformation sections — your output
+   should be proportionally detailed. A 2-paragraph summary is UNACCEPTABLE.
 
 SECTION SUMMARIES:
 {sections_block}
 
-Produce the complete merged notebook summary now:"""
+Produce the complete merged notebook summary now. Do NOT truncate:"""
 
     try:
         merged = call_llm(
             merge_prompt,
             context=f"{name}_merge",
-            max_tokens=LLM_STAGE1_MAX_TOKENS * 2,   # merge output needs more room
-            timeout=LLM_TIMEOUT_STAGE1,
+            max_tokens=LLM_STAGE1_MERGE_MAX_TOKENS,  # dedicated merge token budget
+            timeout=LLM_TIMEOUT_STAGE1_MERGE,         # longer timeout for merging all sections
         )
         log.info("✓ Merged %d sections: %s", len(sections), name)
         error_flag = ("; ".join(section_errors)) if section_errors else None
@@ -705,18 +1019,55 @@ Produce the complete merged notebook summary now:"""
         return {"path": path, "name": name, "summary": fallback, "error": str(e)}
 
 
-def summarize_all_notebooks(paths: list, contents: list) -> list[dict]:
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_CALLS) as executor:
-        futures = {
-            executor.submit(summarize_notebook, p, c): p
-            for p, c in zip(paths, contents) if c is not None
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+def _notebook_sort_key(path: str, src: str) -> int:
+    """
+    Return sort priority for notebook ordering.
+    Canonical order:
+      0: {s_no_api}.py        — API connector / ingestion script
+      1: landing_etl_{s}      — Landing layer
+      2: raw_etl_{s}          — Raw layer
+      3: euh_etl_{s}          — EUH layer
+    Unknown notebooks get priority 999 and appear last.
+    """
+    name = path.split("/")[-1].lower()
+    s = src.lower()
+    s_no_api = s.replace("_api", "")
 
-    order = {p: i for i, p in enumerate(paths)}
-    results.sort(key=lambda x: order.get(x["path"], 999))
+    order = [
+        f"{s_no_api}.py",           # API connector
+        f"landing_etl_{s}",          # Landing layer
+        f"raw_etl_{s}",              # Raw layer
+        f"euh_etl_{s}",              # EUH layer
+    ]
+    for i, prefix in enumerate(order):
+        if name == prefix or name.startswith(prefix):
+            return i
+    return 999  # unknown notebooks go last
+
+
+def summarize_all_notebooks(paths: list, contents: list) -> list[dict]:
+    """
+    Summarise notebooks SEQUENTIALLY in the canonical pipeline order.
+
+    WHY SEQUENTIAL (not parallel):
+    - Guarantees output order matches: connector → landing → raw → euh
+    - Stage 2 builds a coherent narrative that depends on this sequence
+    - Section-level parallelism within each large notebook still applies
+    - Running 4 notebooks in parallel was saturating the LLM endpoint anyway
+    """
+    # Build ordered list of (path, content) pairs
+    valid = [(p, c) for p, c in zip(paths, contents) if c is not None]
+    valid.sort(key=lambda x: _notebook_sort_key(x[0], source))
+
+    log.info("Processing notebooks in order:")
+    for i, (p, _) in enumerate(valid):
+        log.info("  %d. %s", i + 1, p.split("/")[-1])
+
+    results = []
+    for p, c in valid:
+        result = summarize_notebook(p, c)
+        results.append(result)
+
     return results
 
 # COMMAND ----------
@@ -764,10 +1115,28 @@ def summarize_all_notebooks(paths: list, contents: list) -> list[dict]:
 # so any chunk retrieved is self-contained and interpretable.
 # ─────────────────────────────────────────────────────────────────────────────
 
-UNIFIED_DOC_PROMPT = """\
-You are a senior data engineering documentation specialist building a knowledge base
-that will power an AI chatbot (RAG system) for an EV data platform team.
+UNIFIED_DOC_SYSTEM_PROMPT = """\
+You are a senior data engineering documentation specialist.
+You build knowledge base documents for an AI chatbot (RAG system) for an EV data platform team.
 
+RULES YOU MUST FOLLOW:
+1. NEVER use pronouns like "it", "this", "they" to refer to tables, pipelines,
+   or notebooks. Always use the full name.
+   ✗ "It reads from the table and filters it."
+   ✓ "The {source}_sessions notebook reads from raw.{source}_sessions and filters rows where status = 'CANCELLED'."
+2. REPEAT CONTEXT — start each section with a one-line context sentence naming
+   the source system and what the section covers.
+3. USE EXACT NAMES — every table name, column name, function name must appear
+   exactly as in the summaries. No paraphrasing.
+4. NO INFORMATION LOSS — if a notebook summary mentions a table, column,
+   transformation, or business rule, it MUST appear in the final document.
+5. LAYERED DEPTH — first 2-3 sentences in each section give plain English,
+   then go deep technical. Serves both business and engineering readers.
+6. For EVERY column transformation, include: column name, source expression,
+   transformation logic, and business meaning.
+7. You MUST finish with $$END_OUTPUT$$ on its own line."""
+
+UNIFIED_DOC_PROMPT = """\
 Source System  : {source}
 Generated At   : {timestamp}
 Notebooks      : {notebook_list}
@@ -775,42 +1144,11 @@ Notebooks      : {notebook_list}
 Your job is to synthesise the notebook summaries below into ONE comprehensive,
 structured markdown document.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RAG WRITING RULES — FOLLOW STRICTLY:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. NEVER use pronouns like "it", "this", "they" to refer to tables, pipelines,
-   or notebooks. Always use the full name.
-   ✗ "It reads from the table and filters it."
-   ✓ "The {source}_sessions notebook reads from raw.{source}_sessions and filters rows where status = 'CANCELLED'."
-
-2. REPEAT CONTEXT — start each section with a one-line context sentence that
-   names the source system and what the section covers. This ensures any
-   retrieved chunk is self-contained.
-
-3. USE EXACT NAMES — every table name, column name, function name, and
-   variable name must appear exactly as in the code. No paraphrasing.
-
-4. Q&A DENSITY — include at least 20 explicit Q&A pairs in the Q&A section.
-   These are the most valuable RAG signals. Write questions exactly as a
-   team member would ask the chatbot.
-
-5. FAILURE MODES ARE CRITICAL — this is the most common chatbot query type.
-   Every failure mode must include: scenario name, root cause, exact error
-   symptom, detection method, and step-by-step resolution.
-
-6. NO INFORMATION LOSS — if a notebook summary mentions a table, column,
-   transformation, or business rule, it MUST appear somewhere in the final doc.
-   Do not summarise away specifics.
-
-7. LAYERED DEPTH — write each major section so that:
-   - The first 2-3 sentences give the business/plain-English answer
-   - The following paragraphs go deep technical
-   This serves both a business reader and an engineer from the same section.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DOCUMENT STRUCTURE — USE EXACTLY THIS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Synthesise ALL notebook summaries below into the document structure that follows.
+Replace every [placeholder] with real, specific content from the summaries.
+Do not leave any placeholder empty if the summaries contain the information.
+Sections 8-12 (runbook, failure modes, Q&A, glossary, changelog) are
+intentionally excluded from this version.
 
 ---
 
@@ -1051,15 +1389,11 @@ These are critical for debugging and change management.]
 ---
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Now synthesise ALL notebook summaries below into this structure.
-Replace every [placeholder] with real, specific content from the summaries.
-Do not leave any placeholder empty if the summaries contain the information.
-Sections 8-12 (runbook, failure modes, Q&A, glossary, changelog) are
-intentionally excluded from this version — they will be added later.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 NOTEBOOK SUMMARIES:
 {summaries}
+
+You MUST finish with $$END_OUTPUT$$ on its own line.
 """
 
 
@@ -1125,6 +1459,7 @@ NOTEBOOK SUMMARIES:
         context=f"unified_doc_{source}",
         max_tokens=LLM_STAGE2_MAX_TOKENS,
         timeout=LLM_TIMEOUT_STAGE2,
+        system_prompt=UNIFIED_DOC_SYSTEM_PROMPT.format(source=source.title()),
     )
 
 
