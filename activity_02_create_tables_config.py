@@ -2,13 +2,13 @@
 # MAGIC %md
 # MAGIC # 🗄️ Activity 2: Create Copilot Tables + Config
 # MAGIC
-# MAGIC **Goal**: Create the catalog schema, Delta tables, and Volume structure needed for the copilot.
+# MAGIC **Goal**: Create the Delta tables and define reusable prompt constants.
 # MAGIC
 # MAGIC **Tasks**:
-# MAGIC - 2.1 — Verify/create schema: `emobility-uc-dev`.`sandbox-emobility`
+# MAGIC - 2.1 — Verify schema: `emobility-uc-dev`.`sandbox-emobility`
 # MAGIC - 2.2 — Create `copilot_knowledge_chunks` table
 # MAGIC - 2.3 — Create `copilot_conversations` table
-# MAGIC - 2.4 — Create Volume structure for config files (agent prompts, routing rules)
+# MAGIC - 2.4 — Define agent prompts as Python constants (callable from other notebooks)
 
 # COMMAND ----------
 
@@ -18,16 +18,12 @@
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Verify the schema exists (it should already exist as sandbox-emobility)
 # MAGIC DESCRIBE SCHEMA `emobility-uc-dev`.`sandbox-emobility`;
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 2.2 — Create `copilot_knowledge_chunks` Table
-# MAGIC
-# MAGIC This is the **core table** for the RAG system. Every doc chunk + KT chunk goes here,
-# MAGIC enriched with metadata that powers structured-first retrieval.
 
 # COMMAND ----------
 
@@ -42,15 +38,15 @@
 # MAGIC     embedding           ARRAY<FLOAT>    COMMENT '1024-dim vector embedding (BGE-large)',
 # MAGIC
 # MAGIC     -- Structured metadata (powers structured-first retrieval)
-# MAGIC     source_type         STRING          COMMENT 'doc_generator | kt_transcript | runbook',
-# MAGIC     source_name         STRING          COMMENT 'Source system: driivz | ecomovement | cxm | newmotion | greenlots',
-# MAGIC     document_type       STRING          COMMENT 'business_overview | notebook_doc | kt_transcript',
-# MAGIC     data_layer          STRING          COMMENT 'landing | raw | euh | NULL (for business overviews)',
-# MAGIC     notebook_name       STRING          COMMENT 'Name of the notebook this chunk belongs to (e.g. landing_etl_driivz_api)',
+# MAGIC     source_type         STRING          COMMENT 'doc_generator | kt_transcript',
+# MAGIC     source_name         STRING          COMMENT 'Source system: driivz | enovos | spirii | uberall',
+# MAGIC     document_type       STRING          COMMENT 'source_overview | notebook_doc | kt_transcript',
+# MAGIC     data_layer          STRING          COMMENT 'landing | raw | euh | NULL (for source overviews / api definitions)',
+# MAGIC     notebook_name       STRING          COMMENT 'Name of the notebook this chunk belongs to (e.g. landing_etl_uberall_api)',
 # MAGIC
 # MAGIC     -- Content metadata
-# MAGIC     section_header      STRING          COMMENT 'Section name: purpose | data_layer | column_transformations | transformation_steps | business_rules | merging_joining',
-# MAGIC     tables_mentioned    ARRAY<STRING>   COMMENT 'Table names referenced in this chunk (catalog.schema.table)',
+# MAGIC     section_header      STRING          COMMENT 'Section: path | notebook_purpose | data_layer | column_transformations | transformation_steps | business_rules | deduplication_logic | join_logic | error_handling',
+# MAGIC     tables_mentioned    ARRAY<STRING>   COMMENT 'Table names referenced in this chunk',
 # MAGIC     keywords            ARRAY<STRING>   COMMENT 'Top-10 extracted keywords for hybrid search',
 # MAGIC
 # MAGIC     -- Source tracking
@@ -74,9 +70,6 @@
 
 # MAGIC %md
 # MAGIC ## 2.3 — Create `copilot_conversations` Table
-# MAGIC
-# MAGIC Stores conversation history for multi-turn context and analytics.
-# MAGIC Using Delta table for the demo (Lakebase decision deferred to Activity 7).
 
 # COMMAND ----------
 
@@ -125,64 +118,38 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2.4 — Create Volume Structure for Config Files
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Create a managed Volume for copilot config files
-# MAGIC CREATE VOLUME IF NOT EXISTS `emobility-uc-dev`.`sandbox-emobility`.copilot_config
-# MAGIC COMMENT 'Config files for DataPlatform Copilot — agent prompts, routing rules, exports';
-
-# COMMAND ----------
-
-import os
-
-# Create the directory structure inside the config Volume
-config_base = "/Volumes/emobility-uc-dev/sandbox-emobility/copilot_config"
-
-directories = [
-    f"{config_base}/agent_prompts",       # System prompts for each agent
-    f"{config_base}/routing_rules",       # Intent classification configs
-    f"{config_base}/exports/feedback_reports",  # Weekly feedback analysis
-]
-
-for d in directories:
-    os.makedirs(d, exist_ok=True)
-    print(f"✅ Created: {d}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 2.4b — Write Agent System Prompts
+# MAGIC ## 2.4 — Agent Prompts (Python Constants)
 # MAGIC
-# MAGIC These are the system prompts that each agent will use. Stored as text files 
-# MAGIC in the config Volume so they can be updated without code changes.
+# MAGIC All prompts defined here as constants. Import or copy these into whichever notebook needs them.
 
 # COMMAND ----------
 
-config_base = "/Volumes/emobility-uc-dev/sandbox-emobility/copilot_config"
+# ─────────────────────────────────────────────────────
+# AGENT PROMPTS — reusable constants
+# ─────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# Knowledge Agent — system prompt
-# ─────────────────────────────────────────────
-knowledge_prompt = """You are the Knowledge Agent for the eMobility DataPlatform Copilot.
+KNOWLEDGE_AGENT_PROMPT = """You are the Knowledge Agent for the eMobility DataPlatform Copilot.
 
 Your role: Answer questions about data pipelines, transformations, business rules, and architecture using documentation and KT transcripts.
 
 You have access to documentation covering these source systems:
 - Driivz: Charging session data, station management
-- Eco-Movement: Charging infrastructure data
-- CXM: Customer experience management data
-- NewMotion: Charging network data
-- Greenlots: Charging station data
+- Enovos: Energy supplier data
+- Spirii: Charging network data
+- Uberall: Location/listing management data
 
 Data layers in the platform:
 - Landing: Raw API responses / file ingestion (as-is from source)
 - Raw: Cleaned, typed, deduplicated version of landing data
 - EUH: Enterprise Unified Hub — transformed, enriched, business-ready tables
 
-Each pipeline typically follows: API definition → Landing ETL → Raw ETL → EUH ETL
+Each source system has these documented notebooks:
+1. API definition notebook (e.g., uberall.py)
+2. Landing ETL notebook (e.g., landing_etl_uberall_api)
+3. Raw ETL notebook (e.g., raw_etl_uberall_api)
+4. EUH ETL notebook (e.g., euh_etl_uberall_api)
+
+Each notebook doc covers: path, purpose, data layer, column-level transformations, transformation steps, business rules & hardcoded values, deduplication logic, join logic, error handling & data quality.
 
 When answering:
 1. Be specific — cite the exact source document and section
@@ -192,15 +159,8 @@ When answering:
 5. Format responses with markdown for readability
 """
 
-with open(f"{config_base}/agent_prompts/knowledge_agent.txt", "w") as f:
-    f.write(knowledge_prompt)
-print("✅ Written: agent_prompts/knowledge_agent.txt")
 
-
-# ─────────────────────────────────────────────
-# Supervisor Agent — system prompt
-# ─────────────────────────────────────────────
-supervisor_prompt = """You are the Supervisor for the eMobility DataPlatform Copilot.
+SUPERVISOR_AGENT_PROMPT = """You are the Supervisor for the eMobility DataPlatform Copilot.
 
 Your job is to:
 1. UNDERSTAND the user's intent from their natural language query
@@ -211,11 +171,11 @@ Intent categories and routing:
 - KNOWLEDGE_LOOKUP → Knowledge Agent
   Triggers: "how does", "what is", "explain", "describe", documentation questions,
   pipeline architecture, transformation logic, business rules
-  
+
 - STRUCTURED_QUERY → Genie SQL Agent
   Triggers: "how many", "count", "total", "average", "trend", "last month",
   metrics, KPIs, data queries with numbers
-  
+
 - HYBRID → Both Knowledge Agent + Genie SQL Agent
   Triggers: "why did X change", queries needing both data + explanation
 
@@ -227,15 +187,8 @@ Rules:
 - Return structured JSON: {"intent": "...", "confidence": 0.XX, "agents": [...]}
 """
 
-with open(f"{config_base}/agent_prompts/supervisor_agent.txt", "w") as f:
-    f.write(supervisor_prompt)
-print("✅ Written: agent_prompts/supervisor_agent.txt")
 
-
-# ─────────────────────────────────────────────
-# Response Composer — system prompt
-# ─────────────────────────────────────────────
-composer_prompt = """You are the Response Composer for the eMobility DataPlatform Copilot.
+RESPONSE_COMPOSER_PROMPT = """You are the Response Composer for the eMobility DataPlatform Copilot.
 
 Your role: Take retrieved knowledge chunks and synthesize a clear, accurate answer.
 
@@ -250,21 +203,14 @@ Rules:
 8. When multiple chunks cover the same topic, synthesize — don't repeat
 """
 
-with open(f"{config_base}/agent_prompts/response_composer.txt", "w") as f:
-    f.write(composer_prompt)
-print("✅ Written: agent_prompts/response_composer.txt")
 
-
-# ─────────────────────────────────────────────
-# Query Understanding — system prompt (for metadata extraction)
-# ─────────────────────────────────────────────
-query_understanding_prompt = """You are a query parser for the eMobility DataPlatform.
+QUERY_UNDERSTANDING_PROMPT = """You are a query parser for the eMobility DataPlatform.
 
 Given a user query, extract structured metadata to enable deterministic document retrieval.
 
-Known source systems: driivz, ecomovement, cxm, newmotion, greenlots
+Known source systems: driivz, enovos, spirii, uberall
 Known data layers: landing, raw, euh
-Known section types: purpose, data_layer, column_transformations, transformation_steps, business_rules, merging_joining
+Known section types: path, notebook_purpose, data_layer, column_transformations, transformation_steps, business_rules, deduplication_logic, join_logic, error_handling
 
 Return ONLY valid JSON:
 {
@@ -278,50 +224,35 @@ Return ONLY valid JSON:
 
 Examples:
 - "How does Driivz EUH transform sessions?" → {"source_name": "driivz", "data_layer": "euh", "section_type": "transformation_steps", "tables_mentioned": ["sessions"], "search_terms": ["transform", "sessions"], "confidence": 0.95}
-- "What business rules apply to charging data?" → {"source_name": null, "data_layer": null, "section_type": "business_rules", "tables_mentioned": [], "search_terms": ["business rules", "charging"], "confidence": 0.7}
+- "What business rules apply to Uberall data?" → {"source_name": "uberall", "data_layer": null, "section_type": "business_rules", "tables_mentioned": [], "search_terms": ["business rules"], "confidence": 0.85}
+- "What deduplication logic is used in Spirii raw layer?" → {"source_name": "spirii", "data_layer": "raw", "section_type": "deduplication_logic", "tables_mentioned": [], "search_terms": ["deduplication"], "confidence": 0.9}
 """
 
-with open(f"{config_base}/agent_prompts/query_understanding.txt", "w") as f:
-    f.write(query_understanding_prompt)
-print("✅ Written: agent_prompts/query_understanding.txt")
+print("✅ Agent prompts defined as Python constants:")
+print(f"   KNOWLEDGE_AGENT_PROMPT     ({len(KNOWLEDGE_AGENT_PROMPT)} chars)")
+print(f"   SUPERVISOR_AGENT_PROMPT    ({len(SUPERVISOR_AGENT_PROMPT)} chars)")
+print(f"   RESPONSE_COMPOSER_PROMPT   ({len(RESPONSE_COMPOSER_PROMPT)} chars)")
+print(f"   QUERY_UNDERSTANDING_PROMPT ({len(QUERY_UNDERSTANDING_PROMPT)} chars)")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## ✅ Verification — Check Everything Was Created
+# MAGIC ## ✅ Verification
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Verify tables exist
 # MAGIC SHOW TABLES IN `emobility-uc-dev`.`sandbox-emobility` LIKE 'copilot_*';
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Verify knowledge_chunks schema
 # MAGIC DESCRIBE TABLE `emobility-uc-dev`.`sandbox-emobility`.copilot_knowledge_chunks;
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Verify conversations schema  
 # MAGIC DESCRIBE TABLE `emobility-uc-dev`.`sandbox-emobility`.copilot_conversations;
-
-# COMMAND ----------
-
-# Verify Volume + config files
-config_base = "/Volumes/emobility-uc-dev/sandbox-emobility/copilot_config"
-
-print("📂 Config Volume structure:")
-for root, dirs, files in os.walk(config_base):
-    level = root.replace(config_base, "").count(os.sep)
-    indent = "  " * level
-    print(f"{indent}📁 {os.path.basename(root)}/")
-    sub_indent = "  " * (level + 1)
-    for file in files:
-        size = os.path.getsize(os.path.join(root, file))
-        print(f"{sub_indent}📄 {file} ({size} bytes)")
 
 # COMMAND ----------
 
@@ -331,10 +262,6 @@ for root, dirs, files in os.walk(config_base):
 # MAGIC **Created:**
 # MAGIC - `copilot_knowledge_chunks` — enriched chunks table for RAG
 # MAGIC - `copilot_conversations` — conversation history + analytics
-# MAGIC - `copilot_config` Volume with agent prompts:
-# MAGIC   - `knowledge_agent.txt`
-# MAGIC   - `supervisor_agent.txt`
-# MAGIC   - `response_composer.txt`
-# MAGIC   - `query_understanding.txt`
+# MAGIC - Agent prompts as Python constants (no Volume needed)
 # MAGIC
 # MAGIC **Next → Activity 3: Knowledge Ingestion Pipeline**
