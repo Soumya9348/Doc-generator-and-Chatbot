@@ -1,18 +1,19 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 🧭 Activity 7: Python Orchestrator (Supervisor Replacement)
+# MAGIC # 🧭 Activity 7: Copilot Orchestrator (Knowledge Agent + Genie)
 # MAGIC
-# MAGIC Since Supervisor Agent is a managed UI feature (not a Python SDK),
-# MAGIC we build a **Python orchestrator** that does the same thing:
-# MAGIC
-# MAGIC 1. **Classify intent** using Claude (knowledge vs data query)
-# MAGIC 2. **Route** to Knowledge Agent or Genie Space
-# MAGIC 3. **Merge** results for hybrid queries
+# MAGIC **Single notebook** containing the full orchestrator:
+# MAGIC 1. Genie reporting views setup
+# MAGIC 2. Intent classifier
+# MAGIC 3. Knowledge Agent (structured-first + vector fallback)
+# MAGIC 4. Genie Space integration
+# MAGIC 5. Orchestrator (routes to correct agent)
+# MAGIC 6. Conversation logging
 # MAGIC
 # MAGIC ```
-# MAGIC User Query → Intent Classifier → ┬→ Knowledge Agent → Answer
-# MAGIC                                   ├→ Genie Space     → Answer
-# MAGIC                                   └→ Both (HYBRID)   → Merged Answer
+# MAGIC User Query → Intent Classifier → ┬→ Knowledge Agent  → Answer
+# MAGIC                                   ├→ Genie Space       → Answer
+# MAGIC                                   └→ Both (HYBRID)     → Merged Answer
 # MAGIC ```
 
 # COMMAND ----------
@@ -24,8 +25,10 @@
 
 import json
 import re
+import os
 import uuid
 import time
+import hashlib
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -45,15 +48,15 @@ CONFIG = {
     "knowledge_table": "emobility-uc-dev.sandbox-emobility.copilot_knowledge_chunks",
     "conversations_table": "emobility-uc-dev.sandbox-emobility.copilot_conversations",
 
-    # Vector Search
+    # Vector Search (pre-prod)
     "vs_endpoint": "copilot-vs-endpoint",
     "vs_index": "emobility-uc-dev.sandbox-emobility.copilot_knowledge_index",
 
-    # Genie Space — UPDATE with your Genie Space ID
+    # Genie Space — UPDATE with your actual Space ID
     "genie_space_id": "PUT_YOUR_GENIE_SPACE_ID_HERE",
 
     # Retrieval settings
-    "structured_min_chunks": 1,  # Lowered from 2 → even 1 exact match is good
+    "structured_min_chunks": 1,
     "vector_top_k": 5,
     "max_chunks_for_synthesis": 3,
 
@@ -65,16 +68,158 @@ deploy_client = mlflow.deployments.get_deploy_client("databricks")
 vsc = VectorSearchClient(disable_notice=True)
 
 print("✅ Configuration loaded")
+print(f"   LLM:       {CONFIG['llm_endpoint']}")
+print(f"   Embedding: {CONFIG['embedding_endpoint']}")
+print(f"   VS Index:  {CONFIG['vs_index']}")
+print(f"   Genie:     {CONFIG['genie_space_id']}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🧠 Intent Classifier
+# MAGIC ---
+# MAGIC ## Part A: Genie Reporting Views
 # MAGIC
-# MAGIC Determines whether the query is a:
-# MAGIC - **KNOWLEDGE_LOOKUP**: docs, architecture, transformations, business rules
-# MAGIC - **STRUCTURED_QUERY**: metrics, counts, trends → route to Genie
-# MAGIC - **HYBRID**: needs both data + explanation
+# MAGIC Creates views with business-friendly column descriptions so Genie can answer data questions.
+# MAGIC
+# MAGIC **📌 Adjust column names if they don't match your EUH tables.**
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- View 1: Charging Locations
+# MAGIC CREATE OR REPLACE VIEW `emobility-uc-dev`.`sandbox-emobility`.v_genie_charger_locations
+# MAGIC (
+# MAGIC   source            COMMENT 'Source system (driivz, spirii, uberall, enovos)',
+# MAGIC   source_location_id COMMENT 'Unique ID of the charging location in the source system',
+# MAGIC   location_name     COMMENT 'Human-readable name of the charging station/location',
+# MAGIC   operator          COMMENT 'Operator/company managing this charging location',
+# MAGIC   owning_company    COMMENT 'Company that owns this charging location',
+# MAGIC   country_code      COMMENT 'ISO country code (e.g., DE, NL, DK)',
+# MAGIC   city              COMMENT 'City where the location is situated',
+# MAGIC   address           COMMENT 'Street address of the charging location',
+# MAGIC   postal_code       COMMENT 'Postal/ZIP code',
+# MAGIC   latitude          COMMENT 'GPS latitude',
+# MAGIC   longitude         COMMENT 'GPS longitude',
+# MAGIC   status            COMMENT 'Current status (active, inactive)',
+# MAGIC   location_type     COMMENT 'Type of location (e.g., Shell Recharge)',
+# MAGIC   created           COMMENT 'When this record was first created'
+# MAGIC )
+# MAGIC AS
+# MAGIC SELECT source, source_location_id, name AS location_name, operator, owning_company,
+# MAGIC        country_code, city, address, postal_code, latitude, longitude,
+# MAGIC        status, location_type, created
+# MAGIC FROM `emobility-uc-dev`.`euh`.charger_location;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- View 2: EVSE / Charging Points
+# MAGIC CREATE OR REPLACE VIEW `emobility-uc-dev`.`sandbox-emobility`.v_genie_charger_evse
+# MAGIC (
+# MAGIC   source            COMMENT 'Source system (driivz, spirii, uberall, enovos)',
+# MAGIC   location_id       COMMENT 'Internal location ID this EVSE belongs to',
+# MAGIC   source_location_id COMMENT 'Location ID in the source system',
+# MAGIC   source_evse_id    COMMENT 'Unique EVSE ID in the source system',
+# MAGIC   chargepoint_id    COMMENT 'Charge point identifier',
+# MAGIC   latitude          COMMENT 'GPS latitude of the EVSE',
+# MAGIC   longitude         COMMENT 'GPS longitude of the EVSE',
+# MAGIC   created           COMMENT 'When this EVSE record was created',
+# MAGIC   modified          COMMENT 'When this EVSE was last modified'
+# MAGIC )
+# MAGIC AS
+# MAGIC SELECT source, location_id, source_location_id, source_evse_id,
+# MAGIC        chargepoint_id, latitude, longitude, created, modified
+# MAGIC FROM `emobility-uc-dev`.`euh`.charger_evse;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- View 3: Connectors
+# MAGIC CREATE OR REPLACE VIEW `emobility-uc-dev`.`sandbox-emobility`.v_genie_charger_connectors
+# MAGIC (
+# MAGIC   source              COMMENT 'Source system (driivz, spirii, uberall, enovos)',
+# MAGIC   source_connector_id COMMENT 'Unique connector ID in the source system',
+# MAGIC   source_evse_id      COMMENT 'EVSE ID this connector belongs to',
+# MAGIC   connector_type      COMMENT 'Type of connector (e.g., Type 2, CCS, CHAdeMO)',
+# MAGIC   power_type          COMMENT 'Power type: AC or DC',
+# MAGIC   power_kw            COMMENT 'Maximum power output in kilowatts (kW)',
+# MAGIC   phase               COMMENT 'Number of electrical phases (1 or 3)'
+# MAGIC )
+# MAGIC AS
+# MAGIC SELECT source, source_connector_id, source_evse_id,
+# MAGIC        connector_type, power_type, power_kw, phase
+# MAGIC FROM `emobility-uc-dev`.`euh`.charger_connector;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- View 4: Charging Sessions (UNCOMMENT if charger_session table exists)
+# MAGIC
+# MAGIC -- CREATE OR REPLACE VIEW `emobility-uc-dev`.`sandbox-emobility`.v_genie_charger_sessions
+# MAGIC -- (
+# MAGIC --   source                    COMMENT 'Source system (driivz)',
+# MAGIC --   source_session_id         COMMENT 'Unique session ID in the source system',
+# MAGIC --   location_id               COMMENT 'Location where the session occurred',
+# MAGIC --   evse_id                   COMMENT 'EVSE used for this session',
+# MAGIC --   connector_id              COMMENT 'Connector used for this session',
+# MAGIC --   session_start             COMMENT 'When the charging session started',
+# MAGIC --   session_end               COMMENT 'When the charging session ended',
+# MAGIC --   session_duration_seconds  COMMENT 'Total session duration in seconds (includes idle time)',
+# MAGIC --   charging_duration_seconds COMMENT 'Actual charging duration in seconds (energy flowing)',
+# MAGIC --   energy_kwh               COMMENT 'Total energy delivered in kWh',
+# MAGIC --   status                    COMMENT 'Session status (completed, failed, etc.)'
+# MAGIC -- )
+# MAGIC -- AS
+# MAGIC -- SELECT source, source_session_id, location_id, evse_id, connector_id,
+# MAGIC --        session_start, session_end, session_duration_seconds,
+# MAGIC --        charging_duration_seconds, energy_kwh, status
+# MAGIC -- FROM `emobility-uc-dev`.`euh`.charger_session;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- Verify views
+# MAGIC SHOW VIEWS IN `emobility-uc-dev`.`sandbox-emobility` LIKE 'v_genie_*';
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Part B: LLM Helper + Prompts
+
+# COMMAND ----------
+
+def call_llm(system_prompt: str, user_message: str, max_tokens: int = 500, temperature: float = 0) -> str:
+    """Call Claude endpoint and return response text."""
+    response = deploy_client.predict(
+        endpoint=CONFIG["llm_endpoint"],
+        inputs={
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+    )
+    return response["choices"][0]["message"]["content"]
+
+def parse_llm_json(raw: str) -> dict:
+    """Parse JSON from LLM response, handling markdown code blocks."""
+    json_str = raw.strip()
+    if json_str.startswith("```"):
+        json_str = re.sub(r'^```(?:json)?\n?', '', json_str)
+        json_str = re.sub(r'\n?```$', '', json_str)
+    return json.loads(json_str)
+
+
+print("✅ LLM helper defined")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Part C: Intent Classifier
 
 # COMMAND ----------
 
@@ -91,38 +236,16 @@ Examples: "How many active stations are there?", "What was the total revenue las
 HYBRID — Questions that need BOTH data AND explanation. Typically "why" questions or questions that need context alongside numbers.
 Examples: "Why did session count drop last week?", "What's the trend and how does the pipeline handle it?"
 
-Return ONLY valid JSON (no markdown, no explanation):
+Return ONLY valid JSON:
 {"intent": "KNOWLEDGE_LOOKUP|STRUCTURED_QUERY|HYBRID", "confidence": 0.XX, "reasoning": "brief reason"}
 """
 
 
-def call_llm(system_prompt: str, user_message: str, max_tokens: int = 500, temperature: float = 0) -> str:
-    """Call Claude endpoint."""
-    response = deploy_client.predict(
-        endpoint=CONFIG["llm_endpoint"],
-        inputs={
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-    )
-    return response["choices"][0]["message"]["content"]
-
-
 def classify_intent(user_query: str) -> dict:
-    """
-    Classify the user's intent: KNOWLEDGE_LOOKUP, STRUCTURED_QUERY, or HYBRID.
-    """
+    """Classify: KNOWLEDGE_LOOKUP, STRUCTURED_QUERY, or HYBRID."""
     try:
         raw = call_llm(INTENT_CLASSIFIER_PROMPT, user_query, max_tokens=100, temperature=0)
-        json_str = raw.strip()
-        if json_str.startswith("```"):
-            json_str = re.sub(r'^```(?:json)?\n?', '', json_str)
-            json_str = re.sub(r'\n?```$', '', json_str)
-        parsed = json.loads(json_str)
+        parsed = parse_llm_json(raw)
         return {
             "intent": parsed.get("intent", "KNOWLEDGE_LOOKUP"),
             "confidence": parsed.get("confidence", 0.5),
@@ -133,24 +256,19 @@ def classify_intent(user_query: str) -> dict:
         return {"intent": "KNOWLEDGE_LOOKUP", "confidence": 0.5, "reasoning": "fallback"}
 
 
-# Test
 print("✅ Intent Classifier defined")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 📚 Knowledge Agent (from Activity 5+6)
-# MAGIC
-# MAGIC Copied here so this notebook is self-contained.
+# MAGIC ---
+# MAGIC ## Part D: Knowledge Agent (Structured-First + Vector Fallback)
 
 # COMMAND ----------
 
-# ─────────────────────────────────────────
-# Query Understanding
-# ─────────────────────────────────────────
 QUERY_UNDERSTANDING_PROMPT = """You are a query parser for the eMobility DataPlatform.
 
-Given a user query, extract structured metadata to enable deterministic document retrieval.
+Given a user query, extract structured metadata for deterministic document retrieval.
 
 Known source systems: driivz, enovos, spirii, uberall
 Known data layers: landing, raw, euh
@@ -160,23 +278,31 @@ Return ONLY valid JSON:
 {"source_name": "<or null>", "data_layer": "<landing|raw|euh or null>", "section_type": "<or null>", "tables_mentioned": [], "search_terms": [], "confidence": 0.XX}
 """
 
+RESPONSE_COMPOSER_PROMPT = """You are the Response Composer for the eMobility DataPlatform Copilot.
 
+Take the retrieved documentation chunks and synthesize a clear, accurate answer.
+
+Rules:
+1. Answer directly — don't repeat the question
+2. Use ONLY the provided chunks — never make up information
+3. Cite sources: [Source: notebook_name §section_name]
+4. If chunks don't fully answer, say what you know and what's missing
+5. Use markdown formatting (headers, bullets, code blocks)
+6. Keep concise but complete (200-400 words)
+7. Include column names and logic when discussing transformations
+"""
+
+# ─── Query Understanding ───
 def understand_query(user_query: str) -> dict:
     try:
         raw = call_llm(QUERY_UNDERSTANDING_PROMPT, user_query, max_tokens=200, temperature=0)
-        json_str = raw.strip()
-        if json_str.startswith("```"):
-            json_str = re.sub(r'^```(?:json)?\n?', '', json_str)
-            json_str = re.sub(r'\n?```$', '', json_str)
-        return json.loads(json_str)
+        return parse_llm_json(raw)
     except:
         return {"source_name": None, "data_layer": None, "section_type": None,
                 "tables_mentioned": [], "search_terms": user_query.lower().split(), "confidence": 0.3}
 
 
-# ─────────────────────────────────────────
-# Structured Retrieval
-# ─────────────────────────────────────────
+# ─── Structured Retrieval ───
 def structured_retrieval(metadata: dict) -> list[dict]:
     conditions = []
     if metadata.get("source_name"):
@@ -197,7 +323,6 @@ def structured_retrieval(metadata: dict) -> list[dict]:
     query = f"""SELECT chunk_id, content, source_name, notebook_name, data_layer, section_header
                 FROM {CONFIG['knowledge_table']} WHERE {where}
                 ORDER BY chunk_index LIMIT 5"""
-
     try:
         rows = spark.sql(query).collect()
         return [{"chunk_id": r.chunk_id, "content": r.content, "source_name": r.source_name or "",
@@ -209,9 +334,7 @@ def structured_retrieval(metadata: dict) -> list[dict]:
         return []
 
 
-# ─────────────────────────────────────────
-# Vector Search Fallback
-# ─────────────────────────────────────────
+# ─── Vector Search Fallback ───
 def embed_query(query: str) -> list[float]:
     response = deploy_client.predict(endpoint=CONFIG["embedding_endpoint"], inputs={"input": [query]})
     return response["data"][0]["embedding"]
@@ -245,32 +368,13 @@ def vector_search(user_query: str, metadata: dict) -> list[dict]:
         return []
 
 
-# ─────────────────────────────────────────
-# Response Composer
-# ─────────────────────────────────────────
-RESPONSE_COMPOSER_PROMPT = """You are the Response Composer for the eMobility DataPlatform Copilot.
-
-Take the retrieved documentation chunks and synthesize a clear, accurate answer.
-
-Rules:
-1. Answer directly — don't repeat the question
-2. Use ONLY the provided chunks — never make up information
-3. Cite sources: [Source: notebook_name §section_name]
-4. If chunks don't fully answer, say what you know and what's missing
-5. Use markdown formatting (headers, bullets, code blocks)
-6. Keep concise but complete (200-400 words)
-7. Include column names and logic when discussing transformations
-"""
-
-
+# ─── Response Composer ───
 def compose_response(user_query: str, chunks: list[dict]) -> dict:
     if not chunks:
         return {"answer": "I don't have documentation covering this topic. Try asking about driivz, enovos, spirii, or uberall.",
                 "citations": [], "method": "none"}
 
-    # Dedup and cap
-    seen = set()
-    unique = []
+    seen, unique = set(), []
     for c in chunks:
         key = c["content"][:200]
         if key not in seen:
@@ -278,7 +382,6 @@ def compose_response(user_query: str, chunks: list[dict]) -> dict:
             unique.append(c)
     top = unique[:CONFIG["max_chunks_for_synthesis"]]
 
-    # Build context
     citations = []
     chunks_text = ""
     for i, c in enumerate(top):
@@ -291,17 +394,23 @@ def compose_response(user_query: str, chunks: list[dict]) -> dict:
     try:
         answer = call_llm(RESPONSE_COMPOSER_PROMPT, prompt, max_tokens=800, temperature=0)
     except Exception as e:
-        answer = f"Error generating response: {e}\n\nRaw chunks:\n"
+        answer = f"Error: {e}\n\nRaw chunks:\n"
         for c in top:
             answer += f"\n**[{c['notebook_name']} §{c['section_header']}]**\n{c['content'][:300]}\n"
 
     return {"answer": answer, "citations": citations, "method": top[0]["method"] if top else "none"}
 
 
-def knowledge_agent(user_query: str) -> dict:
-    """Full Knowledge Agent pipeline: understand → structured → [vector fallback] → compose."""
+# ─── Knowledge Agent Pipeline ───
+def knowledge_agent(user_query: str, verbose: bool = True) -> dict:
+    """Full pipeline: understand → structured → [vector fallback] → compose."""
     metadata = understand_query(user_query)
+    if verbose:
+        print(f"   🏷️ Metadata: source={metadata.get('source_name')}, layer={metadata.get('data_layer')}, section={metadata.get('section_type')}")
+
     structured = structured_retrieval(metadata)
+    if verbose:
+        print(f"   🗄️ Structured: {len(structured)} chunks")
 
     all_chunks = structured
     method = "structured"
@@ -314,6 +423,8 @@ def knowledge_agent(user_query: str) -> dict:
                 all_chunks.append(vc)
                 seen_ids.add(vc["chunk_id"])
         method = "hybrid" if structured else "vector"
+        if verbose:
+            print(f"   🔍 Vector fallback: {len(vector)} chunks → total: {len(all_chunks)}")
 
     result = compose_response(user_query, all_chunks)
     result["retrieval_method"] = method
@@ -326,23 +437,22 @@ print("✅ Knowledge Agent defined")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 📊 Genie Space Integration
-# MAGIC
-# MAGIC For structured data queries (metrics, counts, trends).
-# MAGIC Uses the Databricks Genie API to query your reporting views.
+# MAGIC ---
+# MAGIC ## Part E: Genie Space Integration
 
 # COMMAND ----------
 
-def genie_query(user_query: str) -> dict:
+def genie_query(user_query: str, verbose: bool = True) -> dict:
     """
-    Route a data question to Genie Space.
-    Uses the Databricks SDK Genie API.
+    Route a data question to Genie Space via the Databricks SDK.
+    Handles async polling for results.
     """
     space_id = CONFIG["genie_space_id"]
 
     if space_id == "PUT_YOUR_GENIE_SPACE_ID_HERE":
         return {
-            "answer": "⚠️ **Genie Space not configured.** Please update `CONFIG['genie_space_id']` with your Genie Space ID.\n\nYou can find it in the Databricks UI: **Genie → Your Space → URL contains the space ID.**",
+            "answer": "⚠️ **Genie Space not configured.** Update `CONFIG['genie_space_id']` with your Space ID.\n\n"
+                      "Find it in: **Databricks UI → Genie → your space → URL contains the ID.**",
             "citations": [{"source": "Genie Space", "method": "genie", "layer": "reporting"}],
             "retrieval_method": "genie",
             "sql_generated": None,
@@ -352,92 +462,77 @@ def genie_query(user_query: str) -> dict:
         from databricks.sdk import WorkspaceClient
         w = WorkspaceClient()
 
-        # Start a Genie conversation
-        response = w.genie.start_conversation(
-            space_id=space_id,
-            content=user_query,
-        )
+        if verbose:
+            print(f"   📊 Sending to Genie Space: {space_id}")
 
-        # The Genie API is async — poll for results
+        # Start conversation
+        response = w.genie.start_conversation(space_id=space_id, content=user_query)
         conversation_id = response.conversation_id
         message_id = response.message_id
 
-        # Poll for completion (Genie processes the query)
-        max_wait = 60
-        waited = 0
+        # Poll for completion
+        max_wait, waited = 120, 0
         result = None
 
         while waited < max_wait:
-            try:
-                msg = w.genie.get_message(
-                    space_id=space_id,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                )
-                status = msg.status
-                if status == "COMPLETED":
-                    result = msg
-                    break
-                elif status in ("FAILED", "CANCELLED"):
-                    return {
-                        "answer": f"Genie query failed with status: {status}",
-                        "citations": [{"source": "Genie Space", "method": "genie", "layer": "reporting"}],
-                        "retrieval_method": "genie",
-                        "sql_generated": None,
-                    }
-                time.sleep(3)
-                waited += 3
-            except Exception:
-                time.sleep(3)
-                waited += 3
+            msg = w.genie.get_message(
+                space_id=space_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
+            status = msg.status.value if hasattr(msg.status, 'value') else str(msg.status)
+
+            if status in ("COMPLETED", "COMPLETED_WITH_ERROR"):
+                result = msg
+                break
+            elif status in ("FAILED", "CANCELLED", "QUERY_RESULT_EXPIRED"):
+                return {"answer": f"Genie query failed: {status}", "citations": [],
+                        "retrieval_method": "genie", "sql_generated": None}
+
+            if verbose and waited % 10 == 0:
+                print(f"   ⏳ Genie status: {status} ({waited}s)")
+            time.sleep(3)
+            waited += 3
 
         if result is None:
-            return {
-                "answer": "Genie query timed out. Please try a simpler question.",
-                "citations": [], "retrieval_method": "genie", "sql_generated": None,
-            }
+            return {"answer": "Genie query timed out.", "citations": [],
+                    "retrieval_method": "genie", "sql_generated": None}
 
-        # Extract answer from Genie response
-        # The structure may vary — adapt based on actual API response
+        # Extract answer
         answer_text = ""
         sql_generated = None
 
         for attachment in (result.attachments or []):
-            if attachment.text:
+            if hasattr(attachment, 'text') and attachment.text:
                 answer_text += attachment.text.content + "\n"
-            if attachment.query:
-                sql_generated = attachment.query.query
-                # If there are query results, format them
-                if attachment.query.result:
-                    answer_text += "\n**Query Results:**\n"
-                    # Format as table
-                    columns = [col.name for col in (attachment.query.result.columns or [])]
-                    if columns:
-                        answer_text += "| " + " | ".join(columns) + " |\n"
-                        answer_text += "| " + " | ".join(["---"] * len(columns)) + " |\n"
-                        for row in (attachment.query.result.data_array or [])[:20]:
-                            answer_text += "| " + " | ".join(str(v) for v in row) + " |\n"
 
-        if not answer_text:
-            answer_text = "Genie processed your query but returned no text response."
+            if hasattr(attachment, 'query') and attachment.query:
+                sql_generated = attachment.query.query
+
+                if hasattr(attachment.query, 'result') and attachment.query.result:
+                    res = attachment.query.result
+                    columns = [col.name for col in (res.columns or [])]
+                    data = res.data_array or []
+
+                    if columns and data:
+                        answer_text += "\n| " + " | ".join(columns) + " |\n"
+                        answer_text += "| " + " | ".join(["---"] * len(columns)) + " |\n"
+                        for row in data[:20]:
+                            answer_text += "| " + " | ".join(str(v or "") for v in row) + " |\n"
 
         return {
-            "answer": answer_text.strip(),
+            "answer": answer_text.strip() or "Query completed but no text returned.",
             "citations": [{"source": "Genie Space", "method": "genie", "layer": "reporting"}],
             "retrieval_method": "genie",
             "sql_generated": sql_generated,
         }
 
     except ImportError:
-        return {
-            "answer": "⚠️ `databricks-sdk` not available. Install it or update your cluster.",
-            "citations": [], "retrieval_method": "genie", "sql_generated": None,
-        }
+        return {"answer": "⚠️ `databricks-sdk` not available.", "citations": [],
+                "retrieval_method": "genie", "sql_generated": None}
     except Exception as e:
-        return {
-            "answer": f"Genie query error: {str(e)}",
-            "citations": [], "retrieval_method": "genie", "sql_generated": None,
-        }
+        return {"answer": f"Genie error: {str(e)}", "citations": [],
+                "retrieval_method": "genie", "sql_generated": None}
 
 
 print("✅ Genie Space integration defined")
@@ -445,122 +540,108 @@ print("✅ Genie Space integration defined")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🧭 The Orchestrator
-# MAGIC
-# MAGIC Routes queries to the correct agent based on intent classification.
+# MAGIC ---
+# MAGIC ## Part F: The Orchestrator
 
 # COMMAND ----------
 
 class CopilotOrchestrator:
     """
-    The main orchestrator — replaces Supervisor Agent with Python logic.
-    
-    Flow:
-    1. Classify intent (Claude)
-    2. Route to Knowledge Agent or Genie Space
-    3. For HYBRID, call both and merge
-    4. Log conversation turn
+    Main orchestrator — classifies intent, routes to agents, logs conversations.
     """
-    
+
     def __init__(self):
         self.conversation_id = str(uuid.uuid4())
         self.turn_number = 0
-        self.history = []  # Last N turns for context
-    
-    def query(self, user_query: str, user_role: str = "Engineer") -> dict:
+        self.history = []
+
+    def query(self, user_query: str, user_role: str = "Engineer", verbose: bool = True) -> dict:
         """Process a user query through the full pipeline."""
         self.turn_number += 1
         start_time = time.time()
-        
-        # ─── Step 1: Intent Classification ───
+
+        # ─── Step 1: Intent ───
         intent_result = classify_intent(user_query)
         intent = intent_result["intent"]
-        confidence = intent_result["confidence"]
-        
-        print(f"\n{'='*70}")
-        print(f"💬 [{self.turn_number}] \"{user_query}\"")
-        print(f"   🎯 Intent: {intent} (conf: {confidence:.2f}) — {intent_result['reasoning']}")
-        
-        # ─── Step 2: Route to agent(s) ───
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"💬 [{self.turn_number}] \"{user_query}\"")
+            print(f"   🎯 Intent: {intent} ({intent_result['confidence']:.2f}) — {intent_result['reasoning']}")
+
+        # ─── Step 2: Route ───
         result = None
-        
+
         if intent == "KNOWLEDGE_LOOKUP":
-            print(f"   📚 Routing → Knowledge Agent")
-            result = knowledge_agent(user_query)
-            
+            if verbose:
+                print(f"   📚 Routing → Knowledge Agent")
+            result = knowledge_agent(user_query, verbose=verbose)
+
         elif intent == "STRUCTURED_QUERY":
-            print(f"   📊 Routing → Genie Space")
-            result = genie_query(user_query)
-            
+            if verbose:
+                print(f"   📊 Routing → Genie Space")
+            result = genie_query(user_query, verbose=verbose)
+
         elif intent == "HYBRID":
-            print(f"   🔗 Routing → Knowledge Agent + Genie Space")
-            knowledge_result = knowledge_agent(user_query)
-            genie_result = genie_query(user_query)
-            
-            # Merge: knowledge answer first, then data
-            merged_answer = ""
-            if knowledge_result.get("answer"):
-                merged_answer += "### 📚 From Documentation\n\n"
-                merged_answer += knowledge_result["answer"] + "\n\n"
-            if genie_result.get("answer") and "not configured" not in genie_result["answer"]:
-                merged_answer += "### 📊 From Data\n\n"
-                merged_answer += genie_result["answer"]
-            
+            if verbose:
+                print(f"   🔗 Routing → Knowledge Agent + Genie Space")
+            k_result = knowledge_agent(user_query, verbose=verbose)
+            g_result = genie_query(user_query, verbose=verbose)
+
+            merged = ""
+            if k_result.get("answer"):
+                merged += "### 📚 From Documentation\n\n" + k_result["answer"] + "\n\n"
+            if g_result.get("answer") and "not configured" not in g_result.get("answer", ""):
+                merged += "### 📊 From Data\n\n" + g_result["answer"]
+
             result = {
-                "answer": merged_answer or knowledge_result.get("answer", "No results."),
-                "citations": knowledge_result.get("citations", []) + genie_result.get("citations", []),
+                "answer": merged or k_result.get("answer", "No results."),
+                "citations": k_result.get("citations", []) + g_result.get("citations", []),
                 "retrieval_method": "hybrid",
-                "sql_generated": genie_result.get("sql_generated"),
+                "sql_generated": g_result.get("sql_generated"),
             }
         else:
-            # Default to knowledge
-            result = knowledge_agent(user_query)
-        
+            result = knowledge_agent(user_query, verbose=verbose)
+
         latency_ms = int((time.time() - start_time) * 1000)
-        
-        # ─── Add metadata ───
+
+        # ─── Enrich ───
         result["intent"] = intent
-        result["intent_confidence"] = confidence
+        result["intent_confidence"] = intent_result["confidence"]
         result["latency_ms"] = latency_ms
         result["turn_number"] = self.turn_number
         result["conversation_id"] = self.conversation_id
-        
-        # ─── Store in history ───
-        self.history.append({
-            "turn": self.turn_number,
-            "query": user_query,
-            "intent": intent,
-            "answer_preview": result["answer"][:200],
-        })
-        # Keep last 5 turns
+
+        # ─── History ───
+        self.history.append({"turn": self.turn_number, "query": user_query, "intent": intent})
         if len(self.history) > 5:
             self.history = self.history[-5:]
-        
-        # ─── Log to conversations table ───
+
+        # ─── Log ───
         self._log_conversation(user_query, result, user_role, latency_ms)
-        
+
         # ─── Display ───
-        print(f"\n{'─'*70}")
-        print(f"📝 Answer ({result['retrieval_method'].upper()} | ⏱️ {latency_ms}ms)")
-        print(f"{'─'*70}")
-        print(result["answer"][:1000])
-        if len(result["answer"]) > 1000:
-            print(f"\n... [{len(result['answer']) - 1000} more chars]")
-        
-        if result.get("citations"):
-            print(f"\n📎 Citations:")
-            for c in result["citations"]:
-                print(f"   [{c['method'].upper()}] {c['source']}")
-        
-        if result.get("sql_generated"):
-            print(f"\n💾 SQL Generated:\n{result['sql_generated']}")
-        
+        if verbose:
+            print(f"\n{'─'*70}")
+            print(f"📝 Answer ({result['retrieval_method'].upper()} | ⏱️ {latency_ms}ms)")
+            print(f"{'─'*70}")
+            print(result["answer"][:1500])
+            if len(result["answer"]) > 1500:
+                print(f"\n... [{len(result['answer']) - 1500} more chars]")
+            if result.get("citations"):
+                print(f"\n📎 Citations:")
+                for c in result["citations"]:
+                    print(f"   [{c['method'].upper()}] {c['source']}")
+            if result.get("sql_generated"):
+                print(f"\n💾 SQL:\n{result['sql_generated']}")
+
         return result
-    
-    def _log_conversation(self, user_query: str, result: dict, user_role: str, latency_ms: int):
-        """Log this conversation turn to Delta table."""
+
+    def _log_conversation(self, user_query, result, user_role, latency_ms):
+        """Log turn to conversations table."""
         try:
-            log_data = [{
+            from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, TimestampType, ArrayType
+            log = [{
                 "conversation_id": self.conversation_id,
                 "turn_number": self.turn_number,
                 "user_query": user_query,
@@ -571,17 +652,13 @@ class CopilotOrchestrator:
                 "sources_used": [c["source"] for c in result.get("citations", [])],
                 "sql_generated": result.get("sql_generated"),
                 "confidence_score": float(result.get("intent_confidence", 0)),
-                "feedback": None,
-                "feedback_comment": None,
+                "feedback": None, "feedback_comment": None,
                 "model_used": CONFIG["llm_endpoint"],
-                "token_count_in": None,
-                "token_count_out": None,
+                "token_count_in": None, "token_count_out": None,
                 "latency_ms": latency_ms,
                 "user_role": user_role,
                 "created_at": datetime.now(),
             }]
-            
-            from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, TimestampType, ArrayType
             schema = StructType([
                 StructField("conversation_id", StringType()), StructField("turn_number", IntegerType()),
                 StructField("user_query", StringType()), StructField("intent_classified", StringType()),
@@ -593,64 +670,64 @@ class CopilotOrchestrator:
                 StructField("token_count_out", IntegerType()), StructField("latency_ms", IntegerType()),
                 StructField("user_role", StringType()), StructField("created_at", TimestampType()),
             ])
-            df = spark.createDataFrame(log_data, schema=schema)
+            df = spark.createDataFrame(log, schema=schema)
             df.write.mode("append").saveAsTable(CONFIG["conversations_table"])
         except Exception as e:
-            print(f"   ⚠️ Logging error (non-fatal): {e}")
+            print(f"   ⚠️ Log error: {e}")
 
 
-# Create the orchestrator
 copilot = CopilotOrchestrator()
-print("✅ Copilot Orchestrator ready")
-print(f"   Session: {copilot.conversation_id}")
+print(f"✅ Copilot Orchestrator ready — session: {copilot.conversation_id}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 🧪 Test the Orchestrator
+# MAGIC ---
+# MAGIC ## 🧪 Tests
 
 # COMMAND ----------
 
-# Test 1: Knowledge query
+# Knowledge query
 copilot.query("What are the business rules for Spirii EUH pipeline?")
 
 # COMMAND ----------
 
-# Test 2: Should route to Genie (or show placeholder if not configured)
-copilot.query("How many charging sessions happened last month?")
+# Data query → Genie
+copilot.query("How many charging locations do we have by country?")
 
 # COMMAND ----------
 
-# Test 3: Knowledge query
+# Knowledge query
 copilot.query("What deduplication logic does Driivz use in the raw layer?")
 
 # COMMAND ----------
 
-# Test 4: Source overview
+# Source overview
 copilot.query("What is Enovos and what data does it provide?")
 
 # COMMAND ----------
 
-# Test 5: Column-level question
+# Column-level question
 copilot.query("How is the power_kw column derived in Spirii?")
 
 # COMMAND ----------
 
-# Test 6: Vague question
+# Data query → Genie
+copilot.query("Show me the top 5 cities with the most charging stations")
+
+# COMMAND ----------
+
+# Vague question
 copilot.query("How does data flow through the EV platform?")
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 📊 Check Conversation Log
-
-# COMMAND ----------
-
 # MAGIC %sql
+# MAGIC -- Check conversation log
 # MAGIC SELECT turn_number, intent_classified, agent_used, latency_ms,
 # MAGIC        LEFT(user_query, 60) as query,
 # MAGIC        LEFT(response_text, 100) as answer_preview
-# MAGIC FROM emobility-uc-dev.`sandbox-emobility`.copilot_conversations
+# MAGIC FROM `emobility-uc-dev`.`sandbox-emobility`.copilot_conversations
 # MAGIC ORDER BY created_at DESC
 # MAGIC LIMIT 10;
 
@@ -659,16 +736,17 @@ copilot.query("How does data flow through the EV platform?")
 # MAGIC %md
 # MAGIC ## ✅ Activity 7 Complete
 # MAGIC
-# MAGIC **Built:**
-# MAGIC - **Intent Classifier**: Claude-based routing (KNOWLEDGE_LOOKUP / STRUCTURED_QUERY / HYBRID)
-# MAGIC - **Python Orchestrator**: Routes to Knowledge Agent or Genie Space
-# MAGIC - **Genie Integration**: API stub (update with your Genie Space ID)
-# MAGIC - **Conversation Logging**: Every query logged to `copilot_conversations` table
-# MAGIC - **Session History**: Keeps last 5 turns for future multi-turn context
+# MAGIC **Built (all in one notebook):**
+# MAGIC - Genie reporting views with column descriptions
+# MAGIC - Intent Classifier (KNOWLEDGE / STRUCTURED / HYBRID)
+# MAGIC - Knowledge Agent (structured-first + vector fallback + response composer)
+# MAGIC - Genie Space API integration (async polling + table formatting)
+# MAGIC - Python Orchestrator (routes, merges, logs)
+# MAGIC - Conversation logging to Delta table
 # MAGIC
-# MAGIC **To complete Genie integration:**
-# MAGIC 1. Get your Genie Space ID from the Databricks UI (Genie → your space → URL)
-# MAGIC 2. Update `CONFIG["genie_space_id"]`
-# MAGIC 3. Re-run a STRUCTURED_QUERY test
+# MAGIC **To do:**
+# MAGIC 1. Update `genie_space_id` with your actual Space ID
+# MAGIC 2. Adjust view column names if they don't match your tables
+# MAGIC 3. Uncomment charger_sessions view if that table exists
 # MAGIC
 # MAGIC **Next → Activity 8: Chat UI (Gradio)**
