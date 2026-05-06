@@ -11,6 +11,7 @@ import uuid
 import time
 from datetime import datetime
 
+import requests
 import mlflow.deployments
 
 # ─────────────────────────────────────────────────────────────────
@@ -317,7 +318,7 @@ def knowledge_agent(user_query: str) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 def genie_query(user_query: str) -> dict:
-    """Route a data question to Genie Space via the Databricks SDK."""
+    """Route a data question to Genie Space via REST API."""
     space_id = CONFIG["genie_space_id"]
 
     if space_id == "PUT_YOUR_GENIE_SPACE_ID_HERE":
@@ -328,70 +329,110 @@ def genie_query(user_query: str) -> dict:
         }
 
     try:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient()
+        # Get auth from environment
+        host = os.environ.get("DATABRICKS_HOST", os.environ.get("DATABRICKS_SERVER_HOSTNAME", ""))
+        token = os.environ.get("DATABRICKS_TOKEN", "")
+        if not host.startswith("http"):
+            host = f"https://{host}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        response = w.genie.start_conversation(space_id=space_id, content=user_query)
-        conversation_id = response.conversation_id
-        message_id = response.message_id
+        # Start conversation
+        resp = requests.post(
+            f"{host}/api/2.0/genie/spaces/{space_id}/start-conversation",
+            headers=headers,
+            json={"content": user_query}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        conversation_id = data["conversation"]["id"]
+        message_id = data["message"]["id"]
 
+        # Poll for completion
         max_wait, waited = 120, 0
-        result = None
+        msg = None
         while waited < max_wait:
-            msg = w.genie.get_message(space_id=space_id, conversation_id=conversation_id, message_id=message_id)
-            status = msg.status.value if hasattr(msg.status, 'value') else str(msg.status)
+            msg_resp = requests.get(
+                f"{host}/api/2.0/genie/spaces/{space_id}/conversations/{conversation_id}/messages/{message_id}",
+                headers=headers
+            )
+            msg_resp.raise_for_status()
+            msg = msg_resp.json()
+            status = msg.get("status", "")
+
             if status in ("COMPLETED", "COMPLETED_WITH_ERROR"):
-                result = msg
                 break
-            elif status in ("FAILED", "CANCELLED", "QUERY_RESULT_EXPIRED"):
+            elif status in ("FAILED", "CANCELLED"):
                 return {"answer": f"Genie query failed: {status}", "citations": [],
                         "retrieval_method": "genie", "sql_generated": None, "chart_data": None}
             time.sleep(3)
             waited += 3
 
-        if result is None:
+        if msg is None or msg.get("status") not in ("COMPLETED", "COMPLETED_WITH_ERROR"):
             return {"answer": "Genie query timed out.", "citations": [],
                     "retrieval_method": "genie", "sql_generated": None, "chart_data": None}
 
+        # Parse attachments
         answer_text = ""
         sql_generated = None
         chart_data = None
 
-        for attachment in (result.attachments or []):
-            if hasattr(attachment, 'text') and attachment.text:
-                answer_text += attachment.text.content + "\n"
+        for attachment in msg.get("attachments", []):
+            if "text" in attachment:
+                answer_text += attachment["text"].get("content", "") + "\n"
 
-            if hasattr(attachment, 'query') and attachment.query:
-                sql_generated = attachment.query.query
+            if "query" in attachment:
+                sql_generated = attachment["query"].get("query")
 
-                if hasattr(attachment.query, 'result') and attachment.query.result:
-                    res = attachment.query.result
-                    columns = [col.name for col in (res.columns or [])]
-                    data = res.data_array or []
+                # Extract result data for table + chart
+                query_result = attachment["query"].get("result")
+                if query_result:
+                    columns = [col.get("name", f"col_{i}") for i, col in enumerate(query_result.get("columns", []))]
+                    rows = query_result.get("data_array", [])
 
-                    if columns and data:
+                    if columns and rows:
                         # Build markdown table
                         answer_text += "\n| " + " | ".join(columns) + " |\n"
                         answer_text += "| " + " | ".join(["---"] * len(columns)) + " |\n"
-                        for row in data[:20]:
+                        for row in rows[:20]:
                             answer_text += "| " + " | ".join(str(v or "") for v in row) + " |\n"
 
                         # Build chart_data for frontend
-                        chart_data = {"columns": columns, "rows": [list(row) for row in data[:50]]}
-                        # Auto-detect x/y columns
+                        chart_data = {"columns": columns, "rows": [list(row) for row in rows[:50]]}
+
+                        # Robust column type detection
+                        # Genie returns ALL values as strings, so we need careful parsing
                         num_cols = []
                         cat_cols = []
                         for i, col in enumerate(columns):
-                            sample_vals = [row[i] for row in data[:5] if row[i] is not None]
-                            try:
-                                [float(v) for v in sample_vals]
-                                num_cols.append(col)
-                            except (ValueError, TypeError):
+                            sample_vals = [row[i] for row in rows[:5] if row[i] is not None]
+                            if not sample_vals:
                                 cat_cols.append(col)
+                                continue
+                            is_numeric = True
+                            for v in sample_vals:
+                                try:
+                                    float(str(v).replace(",", "").replace(" ", ""))
+                                except (ValueError, TypeError):
+                                    is_numeric = False
+                                    break
+                            if is_numeric:
+                                num_cols.append(col)
+                            else:
+                                cat_cols.append(col)
+
+                        # Assign x/y columns with fallbacks
                         if cat_cols and num_cols:
                             chart_data["x_col"] = cat_cols[0]
                             chart_data["y_col"] = num_cols[0]
-                            chart_data["suggested_type"] = "pie" if len(data) <= 6 else "bar"
+                        elif len(num_cols) >= 2 and not cat_cols:
+                            chart_data["x_col"] = num_cols[0]
+                            chart_data["y_col"] = num_cols[1]
+                        elif len(columns) >= 2:
+                            chart_data["x_col"] = columns[0]
+                            chart_data["y_col"] = columns[1]
+
+                        if "x_col" in chart_data:
+                            chart_data["suggested_type"] = "pie" if len(rows) <= 6 else "bar"
 
         return {
             "answer": answer_text.strip() or "Query completed but no text returned.",
@@ -401,9 +442,6 @@ def genie_query(user_query: str) -> dict:
             "chart_data": chart_data,
         }
 
-    except ImportError:
-        return {"answer": "⚠️ `databricks-sdk` not available.", "citations": [],
-                "retrieval_method": "genie", "sql_generated": None, "chart_data": None}
     except Exception as e:
         return {"answer": f"Genie error: {str(e)}", "citations": [],
                 "retrieval_method": "genie", "sql_generated": None, "chart_data": None}
