@@ -947,10 +947,10 @@
         const raw = String(r[yIdx] || '0').replace(/,/g, '').trim();
         return parseFloat(raw) || 0;
       });
-      const maxVal = Math.max(...values);
+      const maxVal = Math.max(...values, 1);
 
       const layout = {
-        margin: { l: 55, r: 20, t: 15, b: 55 },
+        margin: { l: 55, r: 30, t: 20, b: 55 },
         height: 320,
         paper_bgcolor: 'white',
         plot_bgcolor: 'white',
@@ -961,22 +961,18 @@
         },
         yaxis: { gridcolor: '#f1f5f9', gridwidth: 1, zeroline: false },
         showlegend: type === 'pie',
-        legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center', font: { size: 11 } },
+        legend: { orientation: 'h', y: -0.15, x: 0.5, xanchor: 'center', font: { size: 11 } },
       };
 
       const hoverTpl = '<b>%{x}</b><br>%{y:,.0f}<extra></extra>';
-      let traces, animConfig;
+      let traces;
 
       switch (type) {
         case 'bar':
           traces = [{
-            x: labels, y: isSwitch ? values : values.map(() => 0), type: 'bar',
-            marker: {
-              color: COLORS.slice(0, labels.length), cornerradius: 6,
-              line: { width: 0 }
-            },
+            x: labels, y: values, type: 'bar',
+            marker: { color: COLORS.slice(0, labels.length), cornerradius: 6 },
             hovertemplate: hoverTpl,
-            texttemplate: '%{y:,.0f}', textposition: 'outside', textfont: { size: 11, color: '#475569' },
           }];
           break;
         case 'pie':
@@ -984,9 +980,9 @@
             labels, values, type: 'pie',
             marker: { colors: COLORS, line: { color: '#fff', width: 2 } },
             textinfo: 'label+percent', textposition: 'inside',
-            textfont: { size: 12, color: '#fff', weight: 600 },
+            textfont: { size: 11, color: '#fff' },
             hole: 0.45, pull: values.map(() => 0.02),
-            rotation: isSwitch ? 0 : -180,
+            rotation: 0,
             hovertemplate: '<b>%{label}</b><br>%{value:,.0f} (%{percent})<extra></extra>',
             sort: false,
           }];
@@ -995,7 +991,7 @@
           break;
         case 'line':
           traces = [{
-            x: labels, y: isSwitch ? values : values.map(() => 0), type: 'scatter', mode: 'lines+markers',
+            x: labels, y: values, type: 'scatter', mode: 'lines+markers',
             line: { color: '#2563eb', width: 3, shape: 'spline' },
             marker: { size: 8, color: '#2563eb', line: { width: 2, color: '#fff' } },
             hovertemplate: hoverTpl,
@@ -1003,7 +999,7 @@
           break;
         case 'area':
           traces = [{
-            x: labels, y: isSwitch ? values : values.map(() => 0), type: 'scatter', fill: 'tozeroy',
+            x: labels, y: values, type: 'scatter', fill: 'tozeroy',
             fillcolor: 'rgba(37,99,235,0.1)',
             line: { color: '#2563eb', width: 2.5, shape: 'spline' },
             marker: { size: 6, color: '#2563eb' },
@@ -1011,16 +1007,15 @@
           }];
           break;
         case 'scatter':
-          const sizes = isSwitch
-            ? values.map(v => Math.max(12, Math.min(40, (v / maxVal) * 40)))
-            : values.map(() => 0);
           traces = [{
             x: labels, y: values, type: 'scatter', mode: 'markers+text',
             marker: {
-              size: sizes, color: COLORS.slice(0, labels.length),
+              size: values.map(v => Math.max(12, Math.min(40, (v / maxVal) * 40))),
+              color: COLORS.slice(0, labels.length),
               line: { width: 2, color: '#fff' }, opacity: 0.85
             },
-            text: labels, textposition: 'top center', textfont: { size: 10, color: '#64748b' },
+            text: labels, textposition: 'top center',
+            textfont: { size: 10, color: '#64748b' },
             hovertemplate: hoverTpl,
           }];
           break;
@@ -1028,48 +1023,83 @@
 
       const plotConfig = { displayModeBar: false, responsive: true };
 
+      // For switching, just re-render instantly
       if (isSwitch) {
-        // Smooth animated transition when switching chart types
-        Plotly.react(chartId, traces, layout, plotConfig).then(() => {
-          // Animate to final state
-          if (type === 'pie') {
-            Plotly.animate(chartId, { data: [{ rotation: 0 }] },
-              { transition: { duration: 800, easing: 'cubic-in-out' }, frame: { duration: 800 } });
-          }
+        Plotly.react(chartId, traces, layout, plotConfig);
+        return;
+      }
+
+      // First render: animate from zero using requestAnimationFrame + Plotly.restyle
+      if (type === 'bar' || type === 'line' || type === 'area') {
+        // Start with zero Y values
+        traces[0].y = values.map(() => 0);
+        Plotly.newPlot(chartId, traces, layout, plotConfig).then(() => {
+          animateValues(chartId, values, 900);
+        });
+      } else if (type === 'pie') {
+        // Start rotated, animate to 0
+        traces[0].rotation = -270;
+        Plotly.newPlot(chartId, traces, layout, plotConfig).then(() => {
+          animateRotation(chartId, -270, 0, 1100);
+        });
+      } else if (type === 'scatter') {
+        // Start with zero bubble sizes
+        traces[0].marker.size = values.map(() => 2);
+        Plotly.newPlot(chartId, traces, layout, plotConfig).then(() => {
+          const targetSizes = values.map(v => Math.max(12, Math.min(40, (v / maxVal) * 40)));
+          animateBubbles(chartId, targetSizes, 800);
         });
       } else {
-        // First render — animate from zero
-        Plotly.newPlot(chartId, traces, layout, plotConfig).then(() => {
-          const el = document.getElementById(chartId);
-          if (!el) return;
-
-          if (type === 'bar' || type === 'line' || type === 'area') {
-            // Animate bars/lines growing from zero to actual values
-            Plotly.animate(chartId, {
-              data: [{ y: values }],
-            }, {
-              transition: { duration: 1000, easing: 'cubic-out' },
-              frame: { duration: 1000 },
-            });
-          } else if (type === 'pie') {
-            // Animate pie spinning in
-            Plotly.animate(chartId, {
-              data: [{ rotation: 0 }],
-            }, {
-              transition: { duration: 1200, easing: 'cubic-out' },
-              frame: { duration: 1200 },
-            });
-          } else if (type === 'scatter') {
-            // Animate bubbles scaling up
-            Plotly.animate(chartId, {
-              data: [{ marker: { size: values.map(v => Math.max(12, Math.min(40, (v / maxVal) * 40))) } }],
-            }, {
-              transition: { duration: 800, easing: 'elastic-out' },
-              frame: { duration: 800 },
-            });
-          }
-        });
+        Plotly.newPlot(chartId, traces, layout, plotConfig);
       }
+    }
+
+    // ── Animation Engine (requestAnimationFrame + Plotly.restyle) ──
+
+    function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+    function easeOutElastic(t) {
+      if (t === 0 || t === 1) return t;
+      return Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * (2 * Math.PI / 3)) + 1;
+    }
+
+    function animateValues(chartId, targetValues, durationMs) {
+      const startTime = performance.now();
+      function step(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / durationMs, 1);
+        const eased = easeOutCubic(progress);
+        const currentY = targetValues.map(v => v * eased);
+        Plotly.restyle(chartId, { y: [currentY] }, [0]);
+        if (progress < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    function animateRotation(chartId, fromRot, toRot, durationMs) {
+      const startTime = performance.now();
+      function step(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / durationMs, 1);
+        const eased = easeOutCubic(progress);
+        const currentRot = fromRot + (toRot - fromRot) * eased;
+        Plotly.restyle(chartId, { rotation: currentRot }, [0]);
+        if (progress < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    function animateBubbles(chartId, targetSizes, durationMs) {
+      const startTime = performance.now();
+      const startSizes = targetSizes.map(() => 2);
+      function step(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / durationMs, 1);
+        const eased = easeOutElastic(progress);
+        const currentSizes = targetSizes.map((target, i) => startSizes[i] + (target - startSizes[i]) * eased);
+        Plotly.restyle(chartId, { 'marker.size': [currentSizes] }, [0]);
+        if (progress < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
     }
 
     function switchChartType(chartId, type, btn) {
