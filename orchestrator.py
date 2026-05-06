@@ -317,6 +317,43 @@ def knowledge_agent(user_query: str) -> dict:
 # Genie Space Integration
 # ─────────────────────────────────────────────────────────────────
 
+def _extract_chart_from_text(text):
+    """Fallback: extract chart data from answer text when Genie returns text-only."""
+    lines = text.strip().split("\n")
+
+    # Try 1: Parse markdown table
+    table_lines = [l for l in lines if l.strip().startswith("|") and "---" not in l]
+    if len(table_lines) >= 2:
+        header = [c.strip() for c in table_lines[0].split("|") if c.strip()]
+        rows = []
+        for line in table_lines[1:]:
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if len(cells) == len(header):
+                rows.append(cells)
+        if header and rows and len(header) >= 2:
+            chart = {"columns": header, "rows": rows, "x_col": header[0], "y_col": header[1]}
+            chart["suggested_type"] = "pie" if len(rows) <= 6 else "bar"
+            return chart
+
+    # Try 2: Parse "label: number" patterns (e.g. "Netherlands: 1,271,050 chargers")
+    pattern = re.findall(
+        r'(?:^|\n)\s*[-*]?\s*\**([A-Za-z][A-Za-z0-9 /().]+?)\**\s*[:=-]\s*\**?([\d,]+(?:\.\d+)?)',
+        text
+    )
+    if len(pattern) >= 2:
+        labels = [m[0].strip() for m in pattern]
+        values = [m[1].replace(",", "") for m in pattern]
+        columns = ["category", "value"]
+        rows = [[labels[i], values[i]] for i in range(len(labels))]
+        return {
+            "columns": columns, "rows": rows,
+            "x_col": "category", "y_col": "value",
+            "suggested_type": "pie" if len(rows) <= 6 else "bar",
+        }
+
+    return None
+
+
 def genie_query(user_query: str) -> dict:
     """Route a data question to Genie Space via REST API."""
     space_id = CONFIG["genie_space_id"]
@@ -433,6 +470,10 @@ def genie_query(user_query: str) -> dict:
 
                         if "x_col" in chart_data:
                             chart_data["suggested_type"] = "pie" if len(rows) <= 6 else "bar"
+
+        # ─── FALLBACK: Parse chart data from answer text if no structured result ───
+        if chart_data is None and answer_text.strip():
+            chart_data = _extract_chart_from_text(answer_text)
 
         return {
             "answer": answer_text.strip() or "Query completed but no text returned.",
