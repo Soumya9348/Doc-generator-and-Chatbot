@@ -1,0 +1,15 @@
+# Databricks App Configuration
+# Deploy with: databricks apps create emobility-copilot --source-code-path /Workspace/path/to/copilot_app
+
+command:
+  - "python"
+  - "app.py"
+
+env:
+  - name: GENIE_SPACE_ID
+    value: "PUT_YOUR_GENIE_SPACE_ID_HERE"
+
+  # These are auto-populated when running as a Databricks App:
+  # - DATABRICKS_SERVER_HOSTNAME
+  # - DATABRICKS_HTTP_PATH
+  # - DATABRICKS_TOKEN
