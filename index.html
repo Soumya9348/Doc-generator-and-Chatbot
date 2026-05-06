@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>eMobility Copilot</title>
 <meta name="description" content="Enterprise AI assistant for EV charging data and architecture knowledge">
+<base href="./">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -198,7 +199,7 @@ async function sendMessage() {
   const typingId = addTypingIndicator();
 
   try {
-    const response = await fetch('/api/query', {
+    const response = await fetch('api/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, conversation_id: conversationId }),
@@ -253,8 +254,14 @@ function addBotMessage(data) {
   const methodLabel = methodMap[data.retrieval_method] || data.retrieval_method;
 
   const latency = (data.latency_ms / 1000).toFixed(1);
-  const chartId = data.chart_data ? `chart_${++chartCounter}` : null;
   const turnNum = data.turn_number || 0;
+
+  // Chart — try backend chart_data first, then parse from answer text
+  let chartInfo = data.chart_data;
+  if ((!chartInfo || !chartInfo.x_col) && data.answer) {
+    chartInfo = extractChartFromText(data.answer);
+  }
+  const chartId = chartInfo && chartInfo.x_col ? `chart_${++chartCounter}` : null;
 
   let html = `
     <div class="avatar">⚡</div>
@@ -267,9 +274,8 @@ function addBotMessage(data) {
       <div class="answer">${marked.parse(data.answer || '')}</div>
   `;
 
-  // Chart
-  if (data.chart_data && data.chart_data.x_col && data.chart_data.y_col) {
-    const suggested = data.chart_data.suggested_type || 'bar';
+  if (chartId && chartInfo) {
+    const suggested = chartInfo.suggested_type || 'bar';
     html += `
       <div class="chart-area">
         <div class="chart-toolbar" id="toolbar_${chartId}">
@@ -326,12 +332,51 @@ function addBotMessage(data) {
   scrollToBottom();
 
   // Render chart after DOM insertion
-  if (chartId && data.chart_data) {
+  if (chartId && chartInfo) {
     setTimeout(() => {
-      window['chartData_' + chartId] = data.chart_data;
-      renderChart(chartId, data.chart_data.suggested_type || 'bar');
+      window['chartData_' + chartId] = chartInfo;
+      renderChart(chartId, chartInfo.suggested_type || 'bar');
     }, 50);
   }
+}
+
+function extractChartFromText(text) {
+  // Try 1: Parse markdown table
+  const lines = text.split('\n');
+  const tableLines = lines.filter(l => l.trim().startsWith('|') && !l.includes('---'));
+  if (tableLines.length >= 2) {
+    const header = tableLines[0].split('|').map(c => c.trim()).filter(c => c);
+    const rows = [];
+    for (let i = 1; i < tableLines.length; i++) {
+      const cells = tableLines[i].split('|').map(c => c.trim()).filter(c => c);
+      if (cells.length === header.length) rows.push(cells);
+    }
+    if (header.length >= 2 && rows.length >= 2) {
+      return { columns: header, rows, x_col: header[0], y_col: header[1],
+               suggested_type: rows.length <= 6 ? 'pie' : 'bar' };
+    }
+  }
+
+  // Try 2: Parse "label: number" patterns
+  const matches = [];
+  const regex = /(?:^|\n)\s*[-*•]?\s*\**([A-Za-z][A-Za-z0-9 /().,]+?)\**\s*[:=–—-]\s*\**?([\d,]+(?:\.\d+)?)/g;
+  let m;
+  while ((m = regex.exec(text)) !== null) {
+    const label = m[1].trim();
+    const value = m[2].replace(/,/g, '');
+    // Skip labels that are too long (probably sentences, not data labels)
+    if (label.length <= 40) matches.push([label, value]);
+  }
+  if (matches.length >= 2) {
+    return {
+      columns: ['category', 'value'],
+      rows: matches,
+      x_col: 'category', y_col: 'value',
+      suggested_type: matches.length <= 6 ? 'pie' : 'bar',
+    };
+  }
+
+  return null;
 }
 
 function addErrorMessage(msg) {
@@ -374,7 +419,10 @@ function renderChart(chartId, type) {
   if (xIdx < 0 || yIdx < 0) return;
 
   const labels = rows.map(r => String(r[xIdx]));
-  const values = rows.map(r => parseFloat(r[yIdx]) || 0);
+  const values = rows.map(r => {
+    const raw = String(r[yIdx] || '0').replace(/,/g, '').trim();
+    return parseFloat(raw) || 0;
+  });
 
   const layout = {
     margin: { l: 50, r: 20, t: 10, b: 50 },
@@ -438,7 +486,7 @@ function sendFeedback(btn, type, turnNumber) {
   row.querySelectorAll('.fb-btn').forEach(b => { b.classList.remove('selected-up', 'selected-down'); });
   btn.classList.add(type === 'positive' ? 'selected-up' : 'selected-down');
 
-  fetch('/api/feedback', {
+  fetch('api/feedback', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ conversation_id: conversationId, turn_number: turnNumber, feedback: type }),
