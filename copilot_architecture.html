@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>eMobility Copilot — Architecture Tree</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{font-family:'Inter',sans-serif;background:#080c18;color:#e2e8f0;min-height:100vh;overflow-x:auto}
+
+.bg-grid{position:fixed;inset:0;z-index:0;background-image:radial-gradient(circle at 1px 1px,rgba(99,102,241,0.05) 1px,transparent 0);background-size:32px 32px}
+.glow{position:fixed;border-radius:50%;filter:blur(150px);opacity:0.08;z-index:0;pointer-events:none;animation:gd 30s ease-in-out infinite}
+.gw1{width:500px;height:500px;background:#FFD500;top:-100px;left:10%}
+.gw2{width:400px;height:400px;background:#00A3E0;bottom:5%;right:5%;animation-delay:10s}
+.gw3{width:350px;height:350px;background:#DD1D21;top:30%;left:55%;animation-delay:5s}
+@keyframes gd{0%,100%{transform:translate(0,0)}50%{transform:translate(30px,-20px)}}
+
+.header{position:relative;z-index:10;text-align:center;padding:32px 20px 8px}
+.header h1{font-size:28px;font-weight:800;letter-spacing:-0.8px;background:linear-gradient(135deg,#FFD500,#FACC15,#DD1D21);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header p{color:#4b5a72;font-size:12px;margin-top:4px}
+.legend{display:flex;gap:14px;justify-content:center;margin-top:10px;flex-wrap:wrap}
+.legend span{font-size:9px;font-weight:700;letter-spacing:0.5px;padding:3px 12px;border-radius:14px}
+.ll{background:rgba(16,185,129,0.1);color:#34d399;border:1px solid rgba(16,185,129,0.2)}
+.lp{background:rgba(244,114,182,0.1);color:#f472b6;border:1px solid rgba(244,114,182,0.2)}
+.hint{text-align:center;padding:8px;z-index:10;position:relative}
+.hint span{color:#3e4a5e;font-size:10px;padding:3px 12px;border:1px solid #1a2035;border-radius:12px;background:rgba(20,25,40,0.5)}
+
+.wrapper{position:relative;width:1800px;margin:0 auto}
+/* ── Tree Canvas ── */
+.tree{position:relative;z-index:5;width:100%;padding:0 40px 80px}
+.tree svg{position:absolute;top:0;left:0;pointer-events:none;z-index:1}
+
+/* ── Nodes ── */
+.nd{position:absolute;z-index:10;border-radius:14px;cursor:pointer;
+  width:max-content;max-width:240px;
+  opacity:0;transform:translate(-50%, 16px);
+  transition:opacity 0.5s ease,transform 0.5s ease,box-shadow 0.3s ease}
+.nd.vis{opacity:1;transform:translateX(-50%)!important}
+.nd:hover{z-index:20}
+
+.nd-in{padding:12px 16px}
+.nd-t{font-size:11px;font-weight:700;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.nd-s{font-size:9px;color:#64748b;margin-top:2px;line-height:1.35;word-wrap:break-word}
+.nd-ic{font-size:16px}
+.nd-chip{display:inline-block;font-size:7px;font-weight:800;padding:2px 6px;border-radius:5px;margin-top:4px;letter-spacing:0.4px}
+
+/* ── Color themes ── */
+.c-root{background:linear-gradient(135deg,rgba(255,213,0,0.15),rgba(250,204,21,0.05));border:1.5px solid rgba(255,213,0,0.4);box-shadow:0 4px 24px rgba(255,213,0,0.1)}
+.c-root:hover{box-shadow:0 8px 40px rgba(255,213,0,0.25);border-color:rgba(255,213,0,0.8);transform:translate(-50%, -3px)!important}
+
+.c-blue{background:linear-gradient(135deg,rgba(0,163,224,0.12),rgba(2,132,199,0.06));border:1px solid rgba(0,163,224,0.25);box-shadow:0 2px 14px rgba(0,163,224,0.06)}
+.c-blue:hover{box-shadow:0 6px 30px rgba(0,163,224,0.2);border-color:rgba(0,163,224,0.5);transform:translate(-50%, -3px)!important}
+
+.c-cyan{background:linear-gradient(135deg,rgba(0,229,255,0.12),rgba(6,182,212,0.06));border:1px solid rgba(0,229,255,0.25);box-shadow:0 2px 14px rgba(0,229,255,0.06)}
+.c-cyan:hover{box-shadow:0 6px 30px rgba(0,229,255,0.2);border-color:rgba(0,229,255,0.5);transform:translate(-50%, -3px)!important}
+
+.c-green{background:linear-gradient(135deg,rgba(0,200,83,0.12),rgba(16,185,129,0.06));border:1px solid rgba(0,200,83,0.25);box-shadow:0 2px 14px rgba(0,200,83,0.06)}
+.c-green:hover{box-shadow:0 6px 30px rgba(0,200,83,0.2);border-color:rgba(0,200,83,0.5);transform:translate(-50%, -3px)!important}
+
+.c-amber{background:linear-gradient(135deg,rgba(249,115,22,0.12),rgba(234,88,12,0.06));border:1px solid rgba(249,115,22,0.25);box-shadow:0 2px 14px rgba(249,115,22,0.06)}
+.c-amber:hover{box-shadow:0 6px 30px rgba(249,115,22,0.2);border-color:rgba(249,115,22,0.5);transform:translate(-50%, -3px)!important}
+
+.c-pink{background:linear-gradient(135deg,rgba(221,29,33,0.12),rgba(185,28,28,0.06));border:1px dashed rgba(221,29,33,0.3);box-shadow:0 2px 14px rgba(221,29,33,0.06)}
+.c-pink:hover{box-shadow:0 6px 30px rgba(221,29,33,0.2);border-color:rgba(221,29,33,0.5);transform:translate(-50%, -3px)!important}
+.c-pink::after{content:'';position:absolute;inset:-3px;border-radius:17px;border:1.5px solid rgba(221,29,33,0.15);animation:pu 3s ease-out infinite;pointer-events:none}
+@keyframes pu{0%{opacity:0.6;transform:scale(1)}100%{opacity:0;transform:scale(1.05)}}
+
+.c-slate{background:linear-gradient(135deg,rgba(100,116,139,0.1),rgba(71,85,105,0.05));border:1px solid rgba(100,116,139,0.2);box-shadow:0 2px 10px rgba(100,116,139,0.04)}
+.c-slate:hover{box-shadow:0 4px 20px rgba(100,116,139,0.15);border-color:rgba(100,116,139,0.4);transform:translate(-50%, -3px)!important}
+
+/* ── Info Panel ── */
+.ov{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);backdrop-filter:blur(10px)}
+.ov.sh{display:flex}
+.pn{max-width:500px;width:92%;border-radius:18px;padding:28px;position:relative;
+  background:linear-gradient(160deg,rgba(25,35,52,0.97),rgba(12,18,35,0.99));
+  border:1px solid rgba(99,102,241,0.12);box-shadow:0 20px 60px rgba(0,0,0,0.5);
+  animation:pop 0.3s cubic-bezier(0.16,1,0.3,1)}
+@keyframes pop{from{opacity:0;transform:scale(0.93) translateY(12px)}to{opacity:1;transform:none}}
+.pn .xb{position:absolute;top:12px;right:12px;width:28px;height:28px;border-radius:50%;border:1px solid #2d3a4f;background:rgba(45,58,79,0.4);color:#94a3b8;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s}
+.pn .xb:hover{background:#475569;color:#fff}
+.pn .pi{font-size:30px;margin-bottom:8px}
+.pn h2{font-size:18px;font-weight:700;background:linear-gradient(135deg,#818cf8,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
+.pn .pb{display:inline-block;padding:2px 9px;border-radius:8px;font-size:9px;font-weight:700;margin-bottom:10px;letter-spacing:0.3px}
+.pb.live{background:rgba(16,185,129,0.1);color:#34d399;border:1px solid rgba(16,185,129,0.2)}
+.pb.proposed{background:rgba(244,114,182,0.1);color:#f472b6;border:1px solid rgba(244,114,182,0.2)}
+.pn .pd{font-size:13px;line-height:1.65;color:#b8c5d6}
+.pn .pd strong{color:#e2e8f0}
+.pn ul{list-style:none;margin-top:10px}
+.pn ul li{font-size:12px;color:#8896aa;padding:3px 0;display:flex;gap:7px;line-height:1.45}
+.pn ul li::before{content:'→';color:#6366f1;font-weight:700;flex-shrink:0}
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="glow gw1"></div><div class="glow gw2"></div><div class="glow gw3"></div>
+
+<div class="wrapper">
+  <div class="header">
+    <h1><img src="https://upload.wikimedia.org/wikipedia/en/e/e8/Shell_logo.svg" alt="Shell Logo" style="height:32px; vertical-align:middle; margin-right:12px; margin-bottom:4px;">eMobility CoPilot — System Architecture</h1>
+    <p>Multi-Agent AI Platform · Click any node to explore</p>
+    <div class="legend"><span class="ll">● LIVE</span><span class="lp">◆ PROPOSED</span></div>
+  </div>
+  <div class="hint"><span>👆 Click any component for details</span></div>
+
+  <div class="tree" id="tree" style="height:1350px">
+  <svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+</div>
+
+<div class="ov" id="ov">
+  <div class="pn"><button class="xb" onclick="cl()">✕</button>
+    <div class="pi" id="pi"></div><h2 id="pt"></h2><span class="pb" id="pb"></span>
+    <div class="pd" id="pd"></div><ul id="pf"></ul>
+  </div>
+</div>
+
+<script>
+// ───────────────────────────────────────────────
+// TREE LAYOUT: Define nodes with x,y positions
+// ───────────────────────────────────────────────
+const C = 900;
+const BK = 300, BG = 700, BT = 1100, BR = 1500; // branch centers
+
+const NODES = [
+  // ── Level 0: Root ──
+  {id:'ui',x:C,y:30,c:'c-root',ic:'🖥️',t:'Chat Interface',s:'Premium UI · Plotly Charts · Onboarding · RCA Workflow'},
+  
+  // ── Level 1: Core ──
+  {id:'flask',x:C-150,y:120,c:'c-root',ic:'⚙️',t:'Flask Backend',s:'Databricks App · REST API · Port 8000'},
+  {id:'auth',x:C+150,y:120,c:'c-root',ic:'🛡️',t:'Auth & Sessions',s:'PAT Token · Session Mgr · Audit Log'},
+  
+  // ── Level 2: Orchestrator ──
+  {id:'orch',x:C,y:210,c:'c-root',ic:'🧠',t:'Orchestrator — Intent Router',s:'LLM Classifier · 5 Intents · Conversation Memory'},
+  
+  // ══════ Level 3: THE 4 AGENT BRANCHES ══════
+  {id:'ka',x:BK,y:320,c:'c-blue',ic:'📚',t:'Knowledge Agent',s:'RAG Pipeline · Structured + Vector · LLM Compose',ch:'LIVE'},
+  {id:'ga',x:BG,y:320,c:'c-cyan',ic:'📊',t:'Genie Agent',s:'NL → SQL · REST API · Chart Extraction',ch:'LIVE'},
+  {id:'ta',x:BT,y:320,c:'c-green',ic:'🎓',t:'Teaching Agent',s:'7-Module LMS · Quiz · 80% Pass · Certificate',ch:'LIVE'},
+  {id:'rca',x:BR,y:320,c:'c-pink',ic:'🚨',t:'RCA Agent',s:'ReAct Loop · Diagnose · Fix · PR · SNOW (v2)',ch:'PROPOSED'},
+
+  // ── Level 4: Agent Sub-Components ──
+  {id:'qu',x:BK-85,y:430,c:'c-blue',ic:'🔍',t:'Query Parser',s:'Extract source, layer, type'},
+  {id:'sr',x:BK+85,y:430,c:'c-blue',ic:'🗄️',t:'SQL Retriever',s:'Structured chunk filtering'},
+  
+  {id:'poll',x:BG-85,y:430,c:'c-cyan',ic:'🔗',t:'API Poller',s:'Poll Genie · 120s timeout'},
+  {id:'ce',x:BG+85,y:430,c:'c-cyan',ic:'📈',t:'Chart Extractor',s:'3-layer fallback parsing'},
+  
+  {id:'sm',x:BT-85,y:430,c:'c-green',ic:'⚙️',t:'State Machine',s:'10 states · Progress track'},
+  {id:'qz',x:BT+85,y:430,c:'c-green',ic:'❓',t:'Quiz Engine',s:'21 MCQs + Final Test'},
+  
+  {id:'react',x:BR-145,y:430,c:'c-pink',ic:'🔄',t:'ReAct Loop',s:'Reason → SQL → Observe'},
+  {id:'fixgen',x:BR,y:430,c:'c-pink',ic:'🔧',t:'Fix Generator',s:'Code diff · Propose'},
+  {id:'prcr',x:BR+145,y:430,c:'c-pink',ic:'📤',t:'PR Creator',s:'Branch · Commit'},
+
+  // ── Level 5: Tools (per-branch) ──
+  {id:'llm1',x:BK-85,y:535,c:'c-slate',ic:'🤖',t:'LLM Client',s:'call_llm() · JSON parse'},
+  {id:'emb',x:BK+85,y:535,c:'c-slate',ic:'📐',t:'Embedding Client',s:'GTE-large-en vectors'},
+  
+  {id:'rest1',x:BG,y:535,c:'c-slate',ic:'🌐',t:'REST Client',s:'Genie API · Headers · Polling'},
+  
+  {id:'llm2',x:BT-85,y:535,c:'c-slate',ic:'🤖',t:'LLM Client',s:'Teaching prompts · T=0.3'},
+  {id:'cert',x:BT+85,y:535,c:'c-slate',ic:'🏆',t:'Certificate Gen',s:'Canvas → PNG · Download'},
+  
+  {id:'sqleng',x:BR-145,y:535,c:'c-slate',ic:'🛢️',t:'SQL Engine',s:'SELECT-only · Safety guard'},
+  {id:'rest2',x:BR,y:535,c:'c-slate',ic:'🌐',t:'REST Client',s:'Jobs + Workspace API'},
+  {id:'gitc',x:BR+145,y:535,c:'c-slate',ic:'🐙',t:'Git Client',s:'GitHub API'},
+
+  // ── Level 6: Prompts ──
+  {id:'ragp',x:BK,y:640,c:'c-amber',ic:'📄',t:'RAG Prompts',s:'Query Understanding + Response Composer'},
+  {id:'geniep',x:BG,y:640,c:'c-amber',ic:'📄',t:'Genie Config',s:'Space ID · Reporting Views'},
+  {id:'teachp',x:BT,y:640,c:'c-amber',ic:'📄',t:'Teaching Prompt',s:'4K token domain knowledge · Official sources'},
+  {id:'rcap',x:BR,y:640,c:'c-amber',ic:'📄',t:'RCA Prompt + Error Lib',s:'Hypothesis chain · MERGE/Cast/Schema patterns'},
+
+  // ── Level 7: Platform Services ──
+  {id:'vs',x:BK-85,y:745,c:'c-slate',ic:'🔍',t:'Vector Search',s:'copilot_knowledge_index'},
+  {id:'fmapi',x:BK+85,y:745,c:'c-slate',ic:'🤖',t:'Foundation Model',s:'Claude Sonnet · Pay-per-token'},
+  
+  {id:'gspace',x:BG,y:745,c:'c-slate',ic:'✨',t:'Genie Space',s:'NL → SQL engine'},
+  
+  {id:'jobsapi',x:BR-145,y:745,c:'c-slate',ic:'📋',t:'Jobs API',s:'Run history · Errors'},
+  {id:'sqlwh',x:BR,y:745,c:'c-slate',ic:'⚡',t:'SQL Warehouse',s:'Serverless · Read-only'},
+  {id:'wsapi',x:BR+145,y:745,c:'c-slate',ic:'📓',t:'Workspace API',s:'Export notebook code'},
+
+  // ── Level 8: Data Layer ──
+  {id:'chunks',x:BK,y:850,c:'c-blue',ic:'📚',t:'Knowledge Chunks',s:'RAG knowledge base · Embeddings · Section metadata'},
+  {id:'euh',x:BG,y:850,c:'c-cyan',ic:'📦',t:'EUH Tables',s:'charger_location · evse · connector · session'},
+  {id:'ocpi',x:BT,y:850,c:'c-green',ic:'🔌',t:'OCPI/OCPP Specs',s:'evroaming.org · OCA · EU AFIR · IEC 62196'},
+  {id:'raw',x:BR,y:850,c:'c-pink',ic:'🗃️',t:'Raw + Landing',s:'Per-source tables · Where RCA investigates'},
+
+  // ── Level 9: External ──
+  {id:'convlog',x:BK,y:955,c:'c-slate',ic:'💾',t:'Conversations Log',s:'Audit trail · Feedback · Latency'},
+  {id:'sources',x:BG,y:955,c:'c-slate',ic:'🏭',t:'CPO/MSP Sources',s:'GREENLOTS · Driivz · Spirii · EcoMovement · CXM'},
+  {id:'github',x:BR-85,y:955,c:'c-pink',ic:'🐙',t:'GitHub',s:'Branch · Commit · PR → develop'},
+  {id:'snow',x:BR+85,y:955,c:'c-pink',ic:'❄️',t:'ServiceNow',s:'Auto-triage incidents · Amit\'s idea'},
+];
+
+// ───────────────────────────────────────────────
+// EDGES: parent → child with branch color
+// ───────────────────────────────────────────────
+const EDGES = [
+  // Root → Core
+  ['ui','flask','#FFD500'],['ui','auth','#FFD500'],
+  ['flask','orch','#FFD500'],['auth','orch','#FFD500'],
+  // Orchestrator → 4 Agents
+  ['orch','ka','#00A3E0'],['orch','ga','#00E5FF'],['orch','ta','#00C853'],['orch','rca','#DD1D21'],
+  // Knowledge branch
+  ['ka','qu','#00A3E0'],['ka','sr','#00A3E0'],
+  ['qu','llm1','#00A3E0'],['sr','emb','#00A3E0'],
+  ['llm1','ragp','#00A3E0'],['emb','ragp','#00A3E0'],
+  ['ragp','vs','#00A3E0'],['ragp','fmapi','#00A3E0'],
+  ['vs','chunks','#00A3E0'],['fmapi','chunks','#00A3E0'],
+  ['sr','chunks','#00A3E0'],['chunks','convlog','#00A3E0'],
+  // Genie branch
+  ['ga','poll','#00E5FF'],['ga','ce','#00E5FF'],
+  ['poll','rest1','#00E5FF'],['ce','rest1','#00E5FF'],
+  ['rest1','geniep','#00E5FF'],
+  ['geniep','gspace','#00E5FF'],
+  ['gspace','euh','#00E5FF'],
+  ['euh','sources','#00E5FF'],
+  // Teaching branch
+  ['ta','sm','#00C853'],['ta','qz','#00C853'],
+  ['sm','llm2','#00C853'],['qz','cert','#00C853'],
+  ['llm2','teachp','#00C853'],
+  ['teachp','ocpi','#00C853'],
+  // RCA branch
+  ['rca','react','#DD1D21'],['rca','fixgen','#DD1D21'],['rca','prcr','#DD1D21'],
+  ['react','sqleng','#DD1D21'],['react','rest2','#DD1D21'],['prcr','gitc','#DD1D21'],
+  ['sqleng','rcap','#DD1D21'],['rest2','rcap','#DD1D21'],['gitc','rcap','#DD1D21'],
+  ['rcap','jobsapi','#DD1D21'],['rcap','wsapi','#DD1D21'],['sqleng','sqlwh','#DD1D21'],
+  ['jobsapi','raw','#DD1D21'],['wsapi','raw','#DD1D21'],['sqlwh','raw','#DD1D21'],
+  ['raw','github','#DD1D21'],['raw','snow','#DD1D21'],
+];
+
+// ───────────────────────────────────────────────
+// INFO DATA
+// ───────────────────────────────────────────────
+const INFO={
+ui:{i:'🖥️',t:'Chat Interface',s:'live',sl:'● LIVE',d:'Premium Claude-inspired chat UI. Single entry point for data queries, onboarding, and incident debugging.',f:['Rich markdown rendering via <strong>Marked.js</strong>','Interactive <strong>Plotly.js</strong> charts with custom requestAnimationFrame animation engine','5 chart types: bar (growing), pie (spinning), line, area, scatter (elastic bounce)','Onboarding UI: curriculum cards, MCQ buttons, progress bar, certificate canvas','RCA UI: confirm/deny buttons, code diff viewer, PR link display']},
+flask:{i:'⚙️',t:'Flask Backend',s:'live',sl:'● LIVE',d:'Lightweight Flask server deployed as a <strong>Databricks App</strong>. No Model Serving needed.',f:['<strong>/api/query</strong> — All user messages','<strong>/api/feedback</strong> — Thumbs up/down','<strong>/api/onboarding/reset</strong> — Restart teaching','Session management: in-memory, per conversation_id, max 50']},
+auth:{i:'🛡️',t:'Auth & Sessions',s:'live',sl:'● LIVE',d:'Authentication via environment variables. Session isolation per conversation.',f:['<strong>DATABRICKS_TOKEN</strong> (PAT) for all API calls','<strong>GENIE_SPACE_ID</strong> for Genie routing','Audit logger: every turn → <strong>copilot_conversations</strong> Delta table','Feedback tracking for quality monitoring']},
+orch:{i:'🧠',t:'Orchestrator — Intent Router',s:'live',sl:'● LIVE',d:'The brain. LLM-powered classifier routes every message to the right agent.',f:['<strong>KNOWLEDGE_LOOKUP</strong> → Knowledge Agent','<strong>STRUCTURED_QUERY</strong> → Genie Agent','<strong>HYBRID</strong> → Both agents, merged response','<strong>ONBOARDING</strong> → Teaching Agent','<strong>INCIDENT_RCA</strong> → RCA Agent','Conversation memory: last 10 turns (with answers)']},
+ka:{i:'📚',t:'Knowledge Agent',s:'live',sl:'● LIVE',d:'RAG pipeline for docs and architecture questions. Hybrid retrieval: structured SQL first, vector fallback.',f:['Query Understanding → Structured Retrieval → Vector Fallback → LLM Compose','Sources: auto-generated pipeline docs (Driivz, Spirii, Enovos, Uberall)','Returns answers with source citations']},
+ga:{i:'📊',t:'Genie Agent',s:'live',sl:'● LIVE',d:'Routes data questions to <strong>Databricks Genie Space</strong> via REST API.',f:['POST /api/2.0/genie/spaces/{id}/start-conversation','Polls for completion (max 120s)','Multi-layer chart extraction: structured → markdown → regex fallback','Comma-stripping for all-string numeric responses']},
+ta:{i:'🎓',t:'Teaching Agent',s:'live',sl:'● LIVE',d:'Full LMS inside the chat. 7-module course with quizzes, final test, and certificate.',f:['State Machine: Welcome → Teach → Quiz → Final Test → Certificate','<strong>Adaptive</strong>: uses conversation history to re-explain differently','3 MCQs per module + 10-question final test (80% pass, 20 min)','Content from: OCPI 2.2.1, OCPP 2.0.1, Unity Catalog schemas','Downloadable certificate (Canvas → PNG)']},
+rca:{i:'🚨',t:'RCA Agent',s:'proposed',sl:'◆ PROPOSED',d:'Autonomous SRE: <strong>Error → Investigate → Diagnose → Fix → PR</strong>.',f:['<strong>ReAct Loop</strong>: LLM reasons → generates diagnostic SQL → executes → observes','Presents RCA with <strong>proof</strong> (actual SQL + data evidence)','User confirm/deny — if denied, re-investigates with new hypothesis','Generates code fix, shows diff, creates PR via GitHub API','<strong>ServiceNow v2</strong> (Amit\'s idea): auto-triage SNOW incidents','Safety: SELECT-only SQL guard, max 5 iterations, user approval for PR']},
+qu:{i:'🔍',t:'Query Parser',s:'live',sl:'● LIVE',d:'LLM extracts structured metadata from user query for deterministic retrieval.',f:['Extracts: source_name, data_layer, section_type, search_terms','Known sources: driivz, enovos, spirii, uberall']},
+sr:{i:'🗄️',t:'SQL Retriever',s:'live',sl:'● LIVE',d:'Structured retrieval from knowledge chunks via SQL WHERE filters.',f:['Filters by source_name, data_layer, section_type','Falls back to LIKE on section_header']},
+poll:{i:'🔗',t:'API Poller',s:'live',sl:'● LIVE',d:'Polls Genie REST API for async query completion.',f:['2-second intervals, 120s max timeout','Handles: EXECUTING, COMPLETED, FAILED states']},
+ce:{i:'📈',t:'Chart Extractor',s:'live',sl:'● LIVE',d:'Multi-layer fallback for extracting chart data from any Genie response format.',f:['Layer 1: Structured data_array','Layer 2: Markdown table parser','Layer 3: Regex "label: 1,234" pattern','Auto-detects: pie (≤6 items) or bar']},
+sm:{i:'⚙️',t:'State Machine',s:'live',sl:'● LIVE',d:'Manages Teaching Agent flow through 10 states.',f:['Welcome → Curriculum → Teaching → Doubt Check → Quiz → Final Test → Certificate','Tracks: current_module, scores[], quiz_progress']},
+qz:{i:'❓',t:'Quiz Engine',s:'live',sl:'● LIVE',d:'Quiz presentation, answer validation, and scoring.',f:['21 module MCQs + 10 final test questions','Instant ✅/❌ feedback with explanations','Short-answer grading via LLM rubric']},
+react:{i:'🔄',t:'ReAct Loop',s:'proposed',sl:'◆ PROPOSED',d:'Core investigation engine. Reason → Act → Observe cycle.',f:['LLM hypothesizes root cause from error + code','Generates diagnostic SQL → executes → analyzes results','Max 5 iterations to prevent infinite loops','Example: MERGE error → find blank site_id → confirmed']},
+fixgen:{i:'🔧',t:'Fix Generator',s:'proposed',sl:'◆ PROPOSED',d:'Generates code fix after confirmed root cause.',f:['Original vs. proposed as a diff','Supports SQL and PySpark fixes','User must approve before PR creation']},
+prcr:{i:'📤',t:'PR Creator',s:'proposed',sl:'◆ PROPOSED',d:'Creates branch, commits fix, opens PR to develop.',f:['Branch: <strong>task/fix-{source}-{issue}</strong>','Auto-generated commit message','Never auto-merges — engineer reviews']},
+llm1:{i:'🤖',t:'LLM Client',s:'live',sl:'● LIVE',d:'Unified LLM calling function. call_llm() + parse_llm_json().',f:['Model: Claude Sonnet via Foundation Model API','Temperature: 0 (classify), 0.2 (RCA), 0.3 (teach)']},
+emb:{i:'📐',t:'Embedding Client',s:'live',sl:'● LIVE',d:'Generates vector embeddings for semantic search.',f:['Model: databricks-gte-large-en','Cosine similarity for chunk ranking']},
+rest1:{i:'🌐',t:'REST Client',s:'live',sl:'● LIVE',d:'HTTP client for Genie conversations.',f:['Bearer token auth','Handles retries, timeouts, error parsing']},
+llm2:{i:'🤖',t:'LLM Client',s:'live',sl:'● LIVE',d:'Same LLM client, used with teaching system prompt.',f:['4K token system prompt with domain knowledge','Full conversation history for adaptive teaching']},
+cert:{i:'🏆',t:'Certificate Generator',s:'live',sl:'● LIVE',d:'Generates downloadable completion certificate.',f:['HTML Canvas → PNG','Name, score, date, completion code']},
+sqleng:{i:'🛢️',t:'SQL Engine',s:'live',sl:'● LIVE',d:'Shared SQL execution with safety guard.',f:['<strong>SELECT/DESCRIBE/SHOW only</strong> — blocks all writes','Timeout handling for long queries']},
+rest2:{i:'🌐',t:'REST Client',s:'proposed',sl:'◆ PROPOSED',d:'HTTP client for Jobs API and Workspace API.',f:['Fetches failed run details + notebook code','PAT token authentication (read-only)']},
+gitc:{i:'🐙',t:'Git Client',s:'proposed',sl:'◆ PROPOSED',d:'GitHub API client for PR workflow.',f:['Create branch, commit, open PR','Target: develop branch']},
+ragp:{i:'📄',t:'RAG Prompts',s:'live',sl:'● LIVE',d:'Two-stage prompt chain for Knowledge Agent.',f:['Query Understanding Prompt → structured metadata extraction','Response Composer Prompt → synthesize with citations']},
+geniep:{i:'📄',t:'Genie Configuration',s:'live',sl:'● LIVE',d:'Genie Space setup with reporting views.',f:['Space ID from environment variable','Configured with EUH reporting views']},
+teachp:{i:'📄',t:'Teaching System Prompt',s:'live',sl:'● LIVE',d:'~4K token prompt with full EV domain knowledge + source citations.',f:['Teaching rules: adaptive, progressive, always cite sources','Domain: CPO/MSP, OCPP/OCPI, Location→EVSE→Connector','Our systems: GREENLOTS, Driivz, Spirii, EcoMovement, CXM','Sources: OCPI 2.2.1, OCPP 2.0.1, EU AFIR, IEC 62196']},
+rcap:{i:'📄',t:'RCA Prompt + Error Library',s:'proposed',sl:'◆ PROPOSED',d:'Drives the ReAct loop with built-in error pattern matching.',f:['MERGE dupes → check blanks/nulls in merge keys','Schema drift → compare DESCRIBE TABLE vs expected','Cast errors → check non-numeric strings','Extensible: add patterns as team encounters them']},
+vs:{i:'🔍',t:'Vector Search',s:'live',sl:'● LIVE',d:'Databricks Vector Search for semantic retrieval.',f:['Index: copilot_knowledge_index','Endpoint: copilot-vs-endpoint','GTE-large-en embeddings (1024 dim)']},
+fmapi:{i:'🤖',t:'Foundation Model API',s:'live',sl:'● LIVE',d:'Databricks-hosted LLM. Pay-per-token, zero infra.',f:['Model: Claude Sonnet (databricks-claude-sonnet-4-6)','~$3/million input tokens','No GPU management, no model serving']},
+gspace:{i:'✨',t:'Genie Space',s:'live',sl:'● LIVE',d:'NL→SQL engine. Translates questions to SQL.',f:['REST API access','Returns: SQL + data + text summary']},
+sqlwh:{i:'⚡',t:'SQL Warehouse',s:'live',sl:'● LIVE',d:'Serverless warehouse for all SQL execution.',f:['Auto-scales, no cluster management','Used by: Knowledge retrieval, RCA diagnostics']},
+jobsapi:{i:'📋',t:'Jobs API',s:'proposed',sl:'◆ PROPOSED',d:'Databricks REST API for fetching failed runs.',f:['GET /api/2.1/jobs/runs/list — recent failures','GET /api/2.1/jobs/runs/get-output — error traces']},
+wsapi:{i:'📓',t:'Workspace API',s:'proposed',sl:'◆ PROPOSED',d:'Exports notebook source code from failed tasks.',f:['GET /api/2.0/workspace/export','Extracts the specific cell that errored']},
+chunks:{i:'📚',t:'Knowledge Chunks',s:'live',sl:'● LIVE',d:'Delta table: RAG knowledge base with embeddings.',f:['Table: copilot_knowledge_chunks','Columns: chunk_id, source_name, data_layer, section_type, chunk_text, embedding']},
+euh:{i:'📦',t:'EUH Tables (Unity Catalog)',s:'live',sl:'● LIVE',d:'Enterprise Unified Hub — harmonized business data.',f:['charger_location — sites, addresses, coordinates','charger_evse — charging points, EVSE IDs, status','charger_connector — plug types, power ratings','charger_session — charging events, energy, cost','Catalog: emobility-uc-dev.euh-emobility']},
+ocpi:{i:'🔌',t:'OCPI/OCPP Specifications',s:'live',sl:'● CONTENT SOURCE',d:'Official specs powering the Teaching Agent\'s knowledge.',f:['OCPI 2.2.1 (evroaming.org) — Roles, Location model','OCPP 2.0.1 (OCA) — Charger↔CPMS communication','EU AFIR — Official CPO/MSP definitions','IEC 62196 — Connector type standards']},
+raw:{i:'🗃️',t:'Raw + Landing Tables',s:'live',sl:'● LIVE',d:'Per-source cleaned data. <strong>Where the RCA Agent investigates.</strong>',f:['Landing: raw API payloads (JSON/CSV), append-only','Raw: cleaned, typed, deduplicated per source','Example: raw.spirii_location — where blank site_id lives']},
+convlog:{i:'💾',t:'Conversations Log',s:'live',sl:'● LIVE',d:'Audit trail for every conversation turn.',f:['Table: copilot_conversations','Tracks: query, intent, response, latency, feedback']},
+sources:{i:'🏭',t:'CPO/MSP Data Sources',s:'live',sl:'● DATA SOURCES',d:'Upstream systems feeding the Landing → Raw → EUH pipeline.',f:['GREENLOTS — EU, APAC, NA regions','Driivz — session + tariff data','Spirii — Danish CPO','EcoMovement — aggregated location data','CXM — our MSP platform','Enovos, Uberall']},
+github:{i:'🐙',t:'GitHub',s:'proposed',sl:'◆ PROPOSED (RCA v1)',d:'RCA Agent creates branches and PRs here.',f:['Branch: task/fix-{source}-{issue}-{date}','PR → develop, engineer reviews and merges']},
+snow:{i:'❄️',t:'ServiceNow',s:'proposed',sl:"◆ PROPOSED (RCA v2) — AMIT'S IDEA",d:'When Sharad and I discussed with Amit, he proposed: auto-triage SNOW incidents. Agent picks up P1/P2 tickets, investigates, posts RCA back.',f:['Monitor SNOW for pipeline incidents','Auto-trigger investigation without human initiation','Post root cause + proof + fix to the ticket','Reduces MTTR metrics tracked by leadership']},
+};
+
+// ───────────────────────────────────────────────
+// RENDER
+// ───────────────────────────────────────────────
+const tree = document.getElementById('tree');
+
+NODES.forEach(n => {
+  const el = document.createElement('div');
+  el.className = `nd ${n.c}`;
+  el.id = n.id;
+  el.dataset.k = n.id;
+  el.style.left = n.x + 'px';
+  el.style.top = n.y + 'px';
+  let chipHtml = '';
+  if(n.ch) {
+    const cc = n.ch === 'LIVE' ? 'background:rgba(16,185,129,0.12);color:#34d399' : 'background:rgba(244,114,182,0.12);color:#f472b6';
+    chipHtml = `<span class="nd-chip" style="${cc}">${n.ch}</span>`;
+  }
+  el.innerHTML = `<div class="nd-in"><div class="nd-t"><span class="nd-ic">${n.ic}</span>${n.t}</div><div class="nd-s">${n.s}</div>${chipHtml}</div>`;
+  tree.appendChild(el);
+});
+
+function gc(el){const r=el.getBoundingClientRect(),c=tree.getBoundingClientRect();return{x:r.left-c.left+r.width/2,y:r.top-c.top+r.height/2}}
+
+function drawEdges(){
+  const s=document.getElementById('svg');
+  s.innerHTML='';s.setAttribute('width',tree.scrollWidth);s.setAttribute('height',tree.scrollHeight);
+  EDGES.forEach(([a,b,col],i)=>{
+    const ea=document.getElementById(a),eb=document.getElementById(b);if(!ea||!eb)return;
+    const p1=gc(ea),p2=gc(eb),pid='e'+i;
+    const dx=Math.abs(p2.x-p1.x),dy=p2.y-p1.y;
+    const cp1y=p1.y+dy*0.4, cp2y=p1.y+dy*0.6;
+    const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d',`M${p1.x},${p1.y} C${p1.x},${cp1y} ${p2.x},${cp2y} ${p2.x},${p2.y}`);
+    path.setAttribute('id',pid);path.setAttribute('stroke',col);path.setAttribute('stroke-width','1.2');
+    path.setAttribute('fill','none');path.setAttribute('opacity','0.18');
+    s.appendChild(path);
+    const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+    c.setAttribute('r','2');c.setAttribute('fill',col);c.setAttribute('opacity','0.6');
+    const am=document.createElementNS('http://www.w3.org/2000/svg','animateMotion');
+    am.setAttribute('dur',`${2+Math.random()*2}s`);am.setAttribute('repeatCount','indefinite');
+    const mp=document.createElementNS('http://www.w3.org/2000/svg','mpath');
+    mp.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#'+pid);
+    am.appendChild(mp);c.appendChild(am);s.appendChild(c);
+  });
+}
+
+// Staggered entrance
+window.addEventListener('load',()=>{
+  const nds=document.querySelectorAll('.nd');
+  nds.forEach((n,i)=>setTimeout(()=>n.classList.add('vis'),80+i*40));
+  setTimeout(drawEdges,80+nds.length*40+300);
+});
+window.addEventListener('resize',drawEdges);
+
+// Click handler
+document.querySelectorAll('.nd[data-k]').forEach(n=>{
+  n.addEventListener('click',()=>{
+    const k=n.dataset.k,d=INFO[k];if(!d)return;
+    document.querySelectorAll('.nd').forEach(x=>x.classList.remove('active'));n.classList.add('active');
+    document.getElementById('pi').textContent=d.i;
+    document.getElementById('pt').textContent=d.t;
+    const b=document.getElementById('pb');b.textContent=d.sl;b.className='pb '+(d.s==='live'?'live':'proposed');
+    document.getElementById('pd').innerHTML=d.d;
+    document.getElementById('pf').innerHTML=d.f.map(x=>'<li>'+x+'</li>').join('');
+    document.getElementById('ov').classList.add('sh');
+  });
+});
+function cl(){document.getElementById('ov').classList.remove('sh');document.querySelectorAll('.nd').forEach(n=>n.classList.remove('active'));}
+document.getElementById('ov').addEventListener('click',e=>{if(e.target===e.currentTarget)cl();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')cl();});
+</script>
+</body>
+</html>
