@@ -2,17 +2,10 @@
 
 ## 1. Opening
 
-Hi everyone.
 
-So, in the functional KT we covered what a CDR is, what the three costs mean, and how the status journey works.
 
-Today we're going into the **technical side** — specifically, the correction chain logic. This is the hardest part of the ETL, and once you understand this, everything else in the notebook is straightforward.
+ **technical side** — specifically, the correction chain logic. This is the hardest part of the ETL, and once you understand this, everything else in the notebook is straightforward.
 
-I'll be sharing my screen with an HTML presentation. Each section has a step-by-step simulator — I'll click through it so you can see exactly what the code does at each stage. Feel free to stop me at any point if something is unclear.
-
-**[Pause]**
-
-Alright, let's start.
 
 ---
 
