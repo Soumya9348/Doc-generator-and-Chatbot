@@ -125,23 +125,6 @@ cdrs.cdr_id = cdr_statuses.cdr_id
 
 The `state` field tells us which processing stage the CDR reached.
 
-A state ending in `SUCCESS` normally means that the corresponding processing step completed successfully.
-
-For example:
-
-- `CHARGEPOINT_SUCCESS` means the charge-point information was successfully identified or enriched.
-- `CHARGETOKEN_SUCCESS` means the charging-token information was successfully identified or enriched.
-- `VALIDATION_SUCCESS` means the CDR passed the required validation.
-- `TARIFF_ENRICHMENT_SUCCESS` means the applicable tariffs were successfully identified and added.
-- `CDR_PRICING_SUCCESS` means CXM successfully calculated the required costs.
-- `PAYMENT_CAPTURE_SUCCESS` means the payment amount was successfully captured.
-
-Similarly, a state ending in `FAILURE` means that an issue occurred at that particular stage.
-
-**[Pause]**
-
-The `timestamp` tells us when each state was created.
-
 By arranging the records in timestamp order, we can understand the sequence in which the CDR moved through CXM.
 
 ---
@@ -183,62 +166,6 @@ So, functionally, we can understand it like this:
 
 ---
 
-## 6. Failure States and Error Information
-
-When a processing stage fails, the `error_code` and `error_description` fields help us understand the reason.
-
-For example, our sample CDR contains this state:
-
-```text
-SESSION_FAILURE
-```
-
-The error code is:
-
-```text
-session_pre_auth_not_found
-```
-
-And the error description is:
-
-```text
-Pre Authorisation was not found
-```
-
-This means CXM could not find the related pre-authorisation information for the session.
-
-**[Pause]**
-
-However, one important point is that a failure in one stage does not always mean the complete CDR flow has stopped.
-
-In our example, even after `SESSION_FAILURE`, the CDR continued through stages such as:
-
-- payment request,
-- BRIM publication,
-- SFS publication,
-- payment capture,
-- and EVDL publication.
-
-Therefore, while investigating an issue, we should look at the **complete status journey** rather than drawing a conclusion from only one state.
-
----
-
-## 7. Downstream Publishing Statuses
-
-The `cdr_statuses` table also tells us whether the CDR was successfully published to downstream systems.
-
-For the sample CDR:
-
-- BRIM publication was successful.
-- SFS publication was successful.
-- EVDL publication was successful.
-- Loyalty publication failed.
-
-For the loyalty failure, the error description is:
-
-```text
-Error publishing priced cdr to loyalty
-```
 
 This shows that publication to the different downstream systems can have independent outcomes.
 
