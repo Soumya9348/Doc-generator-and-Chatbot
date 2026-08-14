@@ -67,39 +67,7 @@ For example, in our sample, the same CDR goes through states such as:
 
 This table therefore gives us the step-by-step journey of the CDR through CXM.
 
-We don’t need to explain every column in this table. The important fields are:
-
-- `cdr_id`
-- `cdr_internal_id`
-- `state`
-- `timestamp`
-- `details`
-- `error_code`
-- `error_description`
-
 ---
-
-## 3. Important Identifiers
-
-The first important field is `cdr_id`.
-
-This is the business identifier of the Charge Detail Record.
-
-In our sample, the value is:
-
-```text
-CH*AUS*6184a12b-2e89-4162-9779-bee38df6efb8
-```
-
-The same `cdr_id` appears for all the status records belonging to this CDR. This allows us to trace the complete processing journey of the same charging record.
-
-**[Pause]**
-
-The next field is `cdr_internal_id`.
-
-This is CXM’s internal identifier for the CDR.
-
-For this example, it is:
 
 ```text
 c919c8e0-ecb0-462b-86f0-8db750b5c3f0
@@ -113,13 +81,6 @@ Therefore, the main technical relationship between the two tables is:
 cdrs.id = cdr_statuses.cdr_internal_id
 ```
 
-We can also relate the tables using the business-level identifier:
-
-```text
-cdrs.cdr_id = cdr_statuses.cdr_id
-```
-
----
 
 ## 4. Understanding the Status Flow
 
